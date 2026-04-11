@@ -1,0 +1,129 @@
+services:
+
+  # ── PostgreSQL + pgvector ────────────────────────────────
+  # Starts FIRST. Everything depends on it.
+  postgres:
+    image: pgvector/pgvector:0.8.2-pg17
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge}
+      POSTGRES_USER: ${POSTGRES_USER:-knowledge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-knowledge}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 30s
+
+  # ── TEI — Embedding Model ────────────────────────────────
+  # Starts SECOND. Downloads model on first boot (~1-2 min).
+  # API waits for this to be healthy before starting.
+  embedding:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    restart: unless-stopped
+    command: --model-id ${EMBEDDING_MODEL:-Snowflake/snowflake-arctic-embed-l-v2.0} --auto-truncate
+    ports:
+      - "127.0.0.1:${EMBEDDING_PORT:-8081}:80"
+    volumes:
+      - ${EMBEDDING_MODELS_DIR:?Set EMBEDDING_MODELS_DIR in .env}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
+
+  # ── TEI — Reranker Model ─────────────────────────────────
+  # OPTIONAL. Only starts with: docker compose --profile rerank up -d
+  # API detects its absence and degrades gracefully.
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    restart: unless-stopped
+    command: --model-id ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3} --auto-truncate
+    ports:
+      - "127.0.0.1:${RERANK_PORT:-8082}:80"
+    volumes:
+      - ${RERANKER_MODELS_DIR:?Set RERANKER_MODELS_DIR in .env}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
+    profiles:
+      - rerank
+
+  # ── Memgraph MAGE — Graph Engine ─────────────────────────
+  # OPTIONAL. Only starts with: docker compose --profile graph up -d
+  # API detects its absence and degrades gracefully.
+  memgraph:
+    image: memgraph/memgraph-mage:3.9.0
+    restart: unless-stopped
+    command: --memory-limit=1024
+    ports:
+      - "127.0.0.1:${MEMGRAPH_PORT:-7687}:7687"
+    volumes:
+      - mgdata:/var/lib/memgraph
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+    profiles:
+      - graph
+
+  # ── API — Orchestrator ───────────────────────────────────
+  # Starts LAST, after postgres + embedding are healthy.
+  # Connects to reranker/memgraph if available, works without them.
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${API_PORT:-5050}:8000"
+    environment:
+      # Postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:?err}@postgres:5432/${POSTGRES_DB:-knowledge}
+      # TEI endpoints (internal Docker network, not host ports)
+      EMBEDDING_URL: http://embedding:80
+      RERANKER_URL: http://reranker:80
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      # Memgraph
+      MEMGRAPH_URL: bolt://memgraph:7687
+      MEMGRAPH_ENABLED: ${MEMGRAPH_ENABLED:-true}
+      # Search tuning
+      HNSW_EF_SEARCH: ${HNSW_EF_SEARCH:-100}
+      DEFAULT_SEARCH_TOP_K: ${DEFAULT_SEARCH_TOP_K:-20}
+      DEFAULT_RERANK_CANDIDATES: ${DEFAULT_RERANK_CANDIDATES:-50}
+      DEFAULT_MIN_SCORE: ${DEFAULT_MIN_SCORE:-0.40}
+      # Chunking
+      CHUNK_SIZE: ${CHUNK_SIZE:-512}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-50}
+      # Server
+      API_WORKERS: ${API_WORKERS:-1}
+      API_LOG_LEVEL: ${API_LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: ${PGDATA_VOLUME:-ragbase_pgdata}
+  mgdata:
+    name: ${MEMGRAPH_VOLUME:-ragbase_mgdata}
