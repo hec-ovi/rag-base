@@ -14,7 +14,7 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              rag-base  (docker compose up)          │
+│              rag-base  (docker compose up)              │
 │                                                         │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐   │
 │  │ Postgres │  │ TEI      │  │ TEI      │  │Memgraph│   │
