@@ -16,9 +16,10 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 
 1. Client sends document to `POST /v1/documents`
 2. API chunks the text (structure-aware, paragraph boundaries, configurable size/overlap)
-3. API embeds all chunks in one batch via TEI (`POST /embed`)
-4. API stores document + chunks + vectors + tsvector in PostgreSQL in a **single atomic transaction** - if embedding fails, nothing is committed
-5. Graph entities/relations are created separately via `/v1/concepts` and `/v1/relations`
+3. **Contextual Chunk Headers (CCH)**: document title + metadata are prepended to each chunk before embedding (e.g. `[React Documentation | source: docs] chunk text...`). This gives the embedding model document-level context per chunk (~28% retrieval improvement). The stored chunk keeps the original text for display.
+4. API embeds all enriched chunks in one batch via TEI (`POST /embed`)
+5. API stores document + chunks + vectors + tsvector in PostgreSQL in a **single atomic transaction** - if embedding fails, nothing is committed
+6. Graph entities/relations are created separately via `/v1/concepts` and `/v1/relations`
 
 ### Retrieval pipeline
 
@@ -463,6 +464,12 @@ docker compose restart api
 - Data destroyed only by `docker compose down - v`.
 - Model cache persists on host filesystem across container rebuilds.
 - OpenAPI docs auto-generated at `/docs` (21 endpoints).
+
+## Recommendations for best retrieval quality
+
+**Contextual Chunk Headers (built-in)**: rag-base automatically prepends document title and metadata to each chunk before embedding. Improves retrieval by ~28%. No configuration needed. Stored chunk text remains original (headers only affect the embedding vector).
+
+**Contextual Retrieval (client-side)**: For further improvement, implement Anthropic's Contextual Retrieval before ingesting. Use an LLM to generate a 50-100 token chunk-specific summary, prepend it to the chunk content, then send to `POST /v1/documents`. Up to 49% fewer retrieval failures. Requires LLM calls at ingest time, so this is a client concern, not built into rag-base.
 
 ## Known limitations
 
