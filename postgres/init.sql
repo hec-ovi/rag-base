@@ -1,5 +1,5 @@
 -- ============================================================
--- knowledge-db schema
+-- rag-base schema
 -- Runs once on first boot (via /docker-entrypoint-initdb.d/)
 -- ============================================================
 

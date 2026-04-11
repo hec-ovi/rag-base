@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Backup the knowledge-db PostgreSQL database to a timestamped SQL file.
+# Backup the rag-base PostgreSQL database to a timestamped SQL file.
 # Usage: ./scripts/backup.sh
 
 set -euo pipefail

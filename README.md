@@ -1,4 +1,6 @@
-# knowledge-db
+# rag-base
+
+> **LLM agents**: see [`llm.txt`](llm.txt) for the full technical reference with all endpoints, request/response examples, configuration, and verified behavior.
 
 Standalone RAG backend. Hybrid search with embeddings, reranking, and knowledge graph.
 
@@ -6,13 +8,13 @@ One `docker compose up`. Any future project gets a working retrieval system.
 
 ## Why
 
-Every RAG project needs the same plumbing: vector storage, embeddings, reranking, search. This repo solves that once. Any future project (legal, medical, whatever) spins this up, connects to the API, and gets a full retrieval backend without writing any infrastructure code.
+Every RAG project needs the same infrastructure: vector storage, embeddings, reranking, search. This repo solves that once. Any future project (legal, medical, whatever) spins this up, connects to the API, and gets a full retrieval backend without writing any infrastructure code.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              knowledge-db  (docker compose up)          │
+│              rag-base  (docker compose up)          │
 │                                                         │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐   │
 │  │ Postgres │  │ TEI      │  │ TEI      │  │Memgraph│   │
@@ -38,21 +40,21 @@ Every RAG project needs the same plumbing: vector storage, embeddings, reranking
 | Service | Image | Role |
 |---|---|---|
 | **Postgres + pgvector** | `pgvector/pgvector:0.8.2-pg17` | Stores documents, chunks, vectors. Handles semantic search (HNSW) and keyword search (tsvector). |
-| **TEI Embed** | `text-embeddings-inference:cpu-1.9` | Turns text into 1024-dim vectors. [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference) is a prebuilt Rust server — same concept as vLLM but for embedding models. |
+| **TEI Embed** | `text-embeddings-inference:cpu-1.9` | Turns text into 1024-dim vectors. [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference) is a prebuilt Rust server - same concept as vLLM but for embedding models. |
 | **TEI Rerank** | `text-embeddings-inference:cpu-1.9` | Cross-encoder reranker. Takes a query + candidates and re-scores them by relevance. Same TEI image, different model. |
 | **Memgraph MAGE** | `memgraph/memgraph-mage:3.9.0` | Knowledge graph engine. Stores concepts and relations. Supports Cypher queries, PageRank, community detection, shortest path. |
 | **API** | Custom (`python:3.12-slim`) | The only custom code. Orchestrates all services: ingests documents, runs hybrid search, merges results. |
 
-TEI Rerank and Memgraph are **optional** — the system works without them, just with reduced capabilities.
+TEI Rerank and Memgraph are **optional** - the system works without them, just with reduced capabilities.
 
 ## Quickstart
 
 ```bash
-git clone <repo-url> && cd knowledge-db
+git clone <repo-url> && cd rag-base
 cp .env.template .env
 ```
 
-Edit `.env` — three things need your attention:
+Edit `.env` - three things need your attention:
 ```env
 POSTGRES_PASSWORD=your-secure-password
 EMBEDDING_MODELS_DIR=/absolute/path/to/your/models/embeddings
@@ -64,7 +66,7 @@ Start the services:
 # Core only (postgres + embedding + api)
 docker compose up -d
 
-# Add reranking (recommended — big quality boost)
+# Add reranking (recommended - big quality boost)
 docker compose --profile rerank up -d
 
 # Add knowledge graph
@@ -116,7 +118,7 @@ What happens internally:
 2. Each chunk is embedded via TEI (1024-dim vector)
 3. Document + chunks + vectors + tsvector stored in Postgres in a single transaction
 
-If embedding fails, nothing is stored — no orphan documents.
+If embedding fails, nothing is stored - no orphan documents.
 
 ### Search
 
@@ -134,17 +136,17 @@ What happens internally:
    - **Semantic**: pgvector cosine similarity over chunk embeddings
    - **Keyword**: PostgreSQL full-text search (tsvector/BM25-style)
    - **Graph**: expand entities from query via Memgraph neighbors (if enabled)
-3. Results merged via **RRF** (Reciprocal Rank Fusion) — a standard formula that boosts results found by multiple retrievers
+3. Results merged via **RRF** (Reciprocal Rank Fusion) - a standard formula that boosts results found by multiple retrievers
 4. Top candidates re-scored by the **cross-encoder reranker** (if enabled)
 5. Final top K returned
 
 You can also hit individual retrievers directly:
-- `POST /v1/search/semantic` — vector only
-- `POST /v1/search/keyword` — keyword only
+- `POST /v1/search/semantic` - vector only
+- `POST /v1/search/keyword` - keyword only
 
 ### Knowledge graph
 
-The graph stores concepts (nodes) and relations (edges). It's separate from document storage — you build it explicitly.
+The graph stores concepts (nodes) and relations (edges). It's separate from document storage - you build it explicitly.
 
 ```bash
 # Create concepts
@@ -174,7 +176,7 @@ curl http://localhost:5050/v1/graph/communities
 curl http://localhost:5050/v1/graph/stats
 ```
 
-Concepts are upserted by name — posting the same name twice updates the existing node instead of creating a duplicate. Self-referencing relations are blocked.
+Concepts are upserted by name - posting the same name twice updates the existing node instead of creating a duplicate. Self-referencing relations are blocked.
 
 ## API reference
 
@@ -284,7 +286,7 @@ Change `EMBEDDING_MODEL` or `RERANK_MODEL` in `.env`, restart. TEI downloads the
 ## Project structure
 
 ```
-knowledge-db/
+rag-base/
 ├── docker-compose.yml      # All 5 services
 ├── .env.template           # Config template (committed)
 ├── .env                    # Your config (gitignored)
@@ -298,6 +300,10 @@ knowledge-db/
 │   └── src/
 ├── tests/                  # Unit + integration tests
 ├── scripts/                # Backup/restore
-├── llm.txt                 # Full technical reference
+├── llm.txt                 # Full technical reference (LLM-ready)
 └── README.md               # This file
 ```
+
+## LLM-ready
+
+This repo includes [`llm.txt`](llm.txt), a structured technical reference designed for LLM agents and AI-assisted development. It contains the full API specification with request/response examples, configuration reference, startup behavior, verified behavior, and known limitations. Point your agent at `llm.txt` for complete context about this project.

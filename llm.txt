@@ -1,4 +1,4 @@
-# knowledge-db — Technical Reference
+# rag-base - Technical Reference
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 1. Client sends document to `POST /v1/documents`
 2. API chunks the text (structure-aware, paragraph boundaries, configurable size/overlap)
 3. API embeds all chunks in one batch via TEI (`POST /embed`)
-4. API stores document + chunks + vectors + tsvector in PostgreSQL in a **single atomic transaction** — if embedding fails, nothing is committed
+4. API stores document + chunks + vectors + tsvector in PostgreSQL in a **single atomic transaction** - if embedding fails, nothing is committed
 5. Graph entities/relations are created separately via `/v1/concepts` and `/v1/relations`
 
 ### Retrieval pipeline
@@ -25,11 +25,11 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 1. Client sends query to `POST /v1/search`
 2. API embeds the query via TEI
 3. Three retrievers run **in parallel**:
-   - **Semantic**: pgvector cosine similarity (`embedding <=> query_vector`) — finds content that means similar things
-   - **Keyword**: PostgreSQL tsvector full-text search (`tsv @@ websearch_to_tsquery`) — finds exact term matches
-   - **Graph**: Memgraph Cypher traversal — expands entities found in the query by 1-2 hops to find related concepts
-4. Results merged via **RRF** (Reciprocal Rank Fusion): `score(d) = sum(1/(60 + rank_i))` per retriever — results found by multiple retrievers get boosted
-5. Top N candidates sent to TEI reranker (`POST /rerank`) — a cross-encoder that scores query-document pairs much more accurately than cosine similarity
+   - **Semantic**: pgvector cosine similarity (`embedding <=> query_vector`) - finds content that means similar things
+   - **Keyword**: PostgreSQL tsvector full-text search (`tsv @@ websearch_to_tsquery`) - finds exact term matches
+   - **Graph**: Memgraph Cypher traversal - expands entities found in the query by 1-2 hops to find related concepts
+4. Results merged via **RRF** (Reciprocal Rank Fusion): `score(d) = sum(1/(60 + rank_i))` per retriever - results found by multiple retrievers get boosted
+5. Top N candidates sent to TEI reranker (`POST /rerank`) - a cross-encoder that scores query-document pairs much more accurately than cosine similarity
 6. Final top K returned to client
 
 ### Why this order
@@ -60,16 +60,16 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 ### reranker (ghcr.io/huggingface/text-embeddings-inference:cpu-1.9)
 - **Port**: 8082 host → 80 internal (configurable via `RERANK_PORT`)
 - **Default model**: `BAAI/bge-reranker-v2-m3` (568M params, multilingual)
-- **Docker profile**: `rerank` — only starts with `docker compose --profile rerank up -d`
+- **Docker profile**: `rerank` - only starts with `docker compose --profile rerank up -d`
 - **Optional**: API works without it, skips reranking step
 - **TEI endpoints**:
-  - `POST /rerank` — request: `{"query": "...", "texts": ["...", "..."]}` → response: `[{"index": 0, "score": 0.95}, ...]`
+  - `POST /rerank` - request: `{"query": "...", "texts": ["...", "..."]}` → response: `[{"index": 0, "score": 0.95}, ...]`
   - `GET /health`, `GET /info`
 
 ### memgraph (memgraph/memgraph-mage:3.9.0)
 - **Port**: 7687 host → 7687 internal (configurable via `MEMGRAPH_PORT`)
 - **Protocol**: Bolt only (no REST). Connected via `neo4j` Python async driver with `bolt://memgraph:7687`
-- **Docker profile**: `graph` — only starts with `docker compose --profile graph up -d`
+- **Docker profile**: `graph` - only starts with `docker compose --profile graph up -d`
 - **Optional**: API works without it, graph endpoints return 503
 - **Algorithms** (via MAGE):
   - `CALL pagerank.get() YIELD node, rank`
@@ -81,7 +81,7 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 ### api (custom, python:3.12-slim-bookworm)
 - **Port**: 5050 host → 8000 internal (configurable via `API_PORT`)
 - **Stack**: FastAPI, asyncpg (Postgres), httpx (TEI), neo4j async driver (Memgraph), uvicorn + uvloop
-- **Depends on**: postgres (healthy) and embedding (healthy) — waits for both before starting
+- **Depends on**: postgres (healthy) and embedding (healthy) - waits for both before starting
 - **Optional services**: tries to reach reranker and memgraph at startup. If unreachable, logs a warning and disables them. **Does not crash.**
 - **Healthcheck**: `GET /health` on internal port 8000
 
@@ -93,7 +93,7 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 2. **TEI embed** starts in parallel. Downloads model on first boot (1-3 min). Healthcheck: `GET /health` on port 80.
 3. **TEI rerank** (if `--profile rerank`) starts in parallel. Downloads its own model.
 4. **Memgraph** (if `--profile graph`) starts in parallel.
-5. **API** starts **last** — Docker `depends_on` waits for Postgres and TEI embed to be healthy.
+5. **API** starts **last** - Docker `depends_on` waits for Postgres and TEI embed to be healthy.
 6. On startup, API probes reranker and memgraph. If unreachable → logs warning, sets them to disabled. If reachable → connects.
 
 **If the reranker finishes downloading after the API starts**: `docker compose restart api`
@@ -132,7 +132,7 @@ Ingest a document. Chunks it, embeds each chunk, stores atomically.
 ```
 
 **Error responses:**
-- `422` — empty title or empty content
+- `422` - empty title or empty content
 
 ### GET /v1/documents?offset=0&limit=20
 
@@ -159,14 +159,14 @@ Get a document with all its chunks.
 ```
 
 **Error responses:**
-- `404` — document not found
+- `404` - document not found
 
 ### DELETE /v1/documents/{id}
 
 Delete document and all its chunks (CASCADE). Returns `204 No Content`.
 
 **Error responses:**
-- `404` — document not found
+- `404` - document not found
 
 ### POST /v1/search
 
@@ -224,7 +224,7 @@ Keyword-only search. Same request/response shape. No vector, graph, or reranking
 
 ### POST /v1/concepts
 
-Create or update a concept node in the knowledge graph. **Upserts by name** — if a concept with the same name exists, it updates type/description/metadata instead of creating a duplicate.
+Create or update a concept node in the knowledge graph. **Upserts by name** - if a concept with the same name exists, it updates type/description/metadata instead of creating a duplicate.
 
 **Request:**
 ```json
@@ -255,8 +255,8 @@ Get a concept with all its outgoing relations.
 ```
 
 **Error responses:**
-- `404` — concept not found
-- `503` — Memgraph is disabled
+- `404` - concept not found
+- `503` - Memgraph is disabled
 
 ### DELETE /v1/concepts/{id}
 
@@ -272,9 +272,9 @@ Create a typed directed edge between two concepts (by name).
 ```
 
 **Error responses:**
-- `400` — self-referencing relation (source_name == target_name)
-- `404` — one or both concepts not found
-- `503` — Memgraph is disabled
+- `400` - self-referencing relation (source_name == target_name)
+- `404` - one or both concepts not found
+- `503` - Memgraph is disabled
 
 ### GET /v1/relations?concept_name=React
 
@@ -310,7 +310,7 @@ Shortest path between two concepts (BFS).
 ```
 
 **Error responses:**
-- `404` — no path exists between the two concepts
+- `404` - no path exists between the two concepts
 
 ### GET /v1/graph/communities
 
@@ -369,7 +369,7 @@ Rerank candidates directly via TEI. Passthrough.
 ```
 
 **Error responses:**
-- `503` — reranker is disabled
+- `503` - reranker is disabled
 
 ### GET /health
 
@@ -392,18 +392,18 @@ Returns full model info from TEI for both embedding and reranker (model ID, dtyp
 |---|---|---|---|
 | `POSTGRES_DB` | `knowledge` | no | Database name |
 | `POSTGRES_USER` | `knowledge` | no | Database user |
-| `POSTGRES_PASSWORD` | — | **yes** | Database password |
+| `POSTGRES_PASSWORD` | -| **yes** | Database password |
 | `POSTGRES_PORT` | `5433` | no | Host port for Postgres (5433 to avoid host Postgres conflicts) |
 | `API_PORT` | `5050` | no | Host port for API |
 | `API_WORKERS` | `1` | no | Uvicorn workers |
 | `API_LOG_LEVEL` | `info` | no | Log level (debug, info, warning, error) |
 | `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | no | HuggingFace embedding model ID |
 | `EMBEDDING_PORT` | `8081` | no | Host port for TEI embed |
-| `EMBEDDING_MODELS_DIR` | — | **yes** | Absolute host path for embedding model cache |
+| `EMBEDDING_MODELS_DIR` | -| **yes** | Absolute host path for embedding model cache |
 | `RERANK_ENABLED` | `true` | no | Whether API tries to connect to reranker |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | no | HuggingFace reranker model ID |
 | `RERANK_PORT` | `8082` | no | Host port for TEI rerank |
-| `RERANKER_MODELS_DIR` | — | **yes** | Absolute host path for reranker model cache |
+| `RERANKER_MODELS_DIR` | -| **yes** | Absolute host path for reranker model cache |
 | `MEMGRAPH_ENABLED` | `true` | no | Whether API tries to connect to Memgraph |
 | `MEMGRAPH_PORT` | `7687` | no | Host port for Memgraph Bolt |
 | `HNSW_M` | `16` | no | HNSW index build param (higher = more connections per node) |
@@ -425,7 +425,7 @@ Returns full model info from TEI for both embedding and reranker (model ID, dtyp
 2. **TEI embed** starts in parallel. Downloads model on first boot (1-3 min). Healthcheck: `GET /health`. Start period: 180s. Retries: 60.
 3. **TEI rerank** (if `--profile rerank`) starts in parallel. Same download behavior.
 4. **Memgraph** (if `--profile graph`) starts in parallel.
-5. **API** starts **last** — `depends_on` waits for Postgres and TEI embed to be healthy.
+5. **API** starts **last** -`depends_on` waits for Postgres and TEI embed to be healthy.
 6. On startup, API probes reranker and memgraph:
    - Reachable → connects, logs info
    - Unreachable → logs warning, disables, continues
@@ -443,7 +443,7 @@ docker compose restart api
 - Hybrid search runs semantic + keyword in parallel, merges with RRF.
 - RRF correctly boosts results found by multiple retrievers (dual-match scores ~2x single-match).
 - Reranker amplifies relevance gap: relevant docs score 0.95+, irrelevant score <0.001.
-- Concepts are upserted by name (MERGE) — no duplicates.
+- Concepts are upserted by name (MERGE) - no duplicates.
 - Self-referencing relations are blocked (400).
 - Cypher injection is prevented by sanitizing relation types to `[A-Za-z0-9_]` only.
 - SQL injection is safe (asyncpg parameterized queries throughout).
@@ -460,7 +460,7 @@ docker compose restart api
 - Ingest-then-search: no delay needed, results available immediately.
 - Cross-domain isolation: legal, medical, tech queries each find their own domain.
 - Data persists across `docker compose down`.
-- Data destroyed only by `docker compose down -v`.
+- Data destroyed only by `docker compose down - v`.
 - Model cache persists on host filesystem across container rebuilds.
 - OpenAPI docs auto-generated at `/docs` (21 endpoints).
 

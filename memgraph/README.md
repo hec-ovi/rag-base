@@ -1,6 +1,6 @@
 # memgraph
 
-Memgraph MAGE — lightweight graph database with 30+ built-in algorithms.
+Memgraph MAGE - lightweight graph database with 30+ built-in algorithms.
 
 **Image:** `memgraph/memgraph-mage:3.9.0`
 **Port:** 7687 Bolt protocol (configurable via `MEMGRAPH_PORT`)

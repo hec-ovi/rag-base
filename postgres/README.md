@@ -11,8 +11,8 @@ Stores documents, chunks, and their vector embeddings. Handles both semantic sea
 
 ## Schema
 
-- `documents` — source documents with JSONB metadata
-- `chunks` — document fragments with `embedding vector(1024)` and auto-generated `tsvector` columns
+- `documents` - source documents with JSONB metadata
+- `chunks` - document fragments with `embedding vector(1024)` and auto-generated `tsvector` columns
 - HNSW index on embeddings (cosine distance)
 - GIN index on tsvector (full-text search)
 - GIN index on document metadata (JSONB)

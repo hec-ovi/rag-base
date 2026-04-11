@@ -1,6 +1,6 @@
 # reranker
 
-Hugging Face Text Embeddings Inference (TEI) — serves the cross-encoder reranking model.
+Hugging Face Text Embeddings Inference (TEI) - serves the cross-encoder reranking model.
 
 **Image:** `ghcr.io/huggingface/text-embeddings-inference:cpu-1.9`
 **Port:** 8082 → container port 80 (configurable via `RERANK_PORT`)

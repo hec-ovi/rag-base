@@ -12,7 +12,7 @@ from pgvector.asyncpg import register_vector
 from src.config import settings
 from src.routers import concepts, documents, embed, graph, health, rerank, relations, search
 
-logger = logging.getLogger("knowledge-db")
+logger = logging.getLogger("rag-base")
 
 
 async def _init_connection(conn):
@@ -92,7 +92,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="knowledge-db",
+    title="rag-base",
     description="RAG backend — hybrid search with embeddings, reranking, and knowledge graph.",
     version="0.1.0",
     lifespan=lifespan,

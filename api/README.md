@@ -1,6 +1,6 @@
 # api
 
-FastAPI orchestrator — the only custom code in this stack.
+FastAPI orchestrator - the only custom code in this stack.
 
 **Image:** Built from `Dockerfile` (python:3.12-slim-bookworm)
 **Port:** 5050 host → 8000 internal (configurable via `API_PORT`)
@@ -18,7 +18,7 @@ Thin REST API that ties together Postgres, TEI embedding, TEI reranker, and Memg
 
 Requires Postgres and TEI embedding to be healthy before starting (`depends_on` in compose).
 
-Reranker and Memgraph are **optional** — the API probes them at startup. If unreachable, it logs a warning and disables them. The API never crashes due to missing optional services.
+Reranker and Memgraph are **optional** - the API probes them at startup. If unreachable, it logs a warning and disables them. The API never crashes due to missing optional services.
 
 ## Stack
 

@@ -1,13 +1,13 @@
 # embedding
 
-Hugging Face Text Embeddings Inference (TEI) — serves the embedding model.
+Hugging Face Text Embeddings Inference (TEI) - serves the embedding model.
 
 **Image:** `ghcr.io/huggingface/text-embeddings-inference:cpu-1.9`
 **Port:** 8081 → container port 80 (configurable via `EMBEDDING_PORT`)
 
 ## What it does
 
-Turns text into vectors. The API sends it text, TEI returns a 1024-dimensional vector. No custom code — just a prebuilt image with a model name.
+Turns text into vectors. The API sends it text, TEI returns a 1024-dimensional vector. No custom code - just a prebuilt image with a model name.
 
 ## Default model
 

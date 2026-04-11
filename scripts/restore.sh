@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore a knowledge-db PostgreSQL backup.
+# Restore a rag-base PostgreSQL backup.
 # Usage: ./scripts/restore.sh backup_20260411_120000.sql
 
 set -euo pipefail
