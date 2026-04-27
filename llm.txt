@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Standalone containerized RAG backend. Hybrid retrieval (semantic + keyword + graph) with embedding and reranking, exposed as a REST API.
+Standalone containerized RAG backend. Hybrid retrieval (semantic + keyword + graph) with embedding, reranking, knowledge-graph extraction (LightRAG), and a graph-only fast-mode endpoint. Exposed as a REST API.
 
 ## Why this exists
 
-Every RAG project needs the same infrastructure: vector storage, embeddings, reranking, search. This solves that once as a plug-and-play service. Future projects (legal, medical, etc.) spin this up and only write the frontend/business logic.
+Every RAG project needs the same infrastructure: vector storage, embeddings, BM25, reranking, a knowledge graph, NER. This repo solves all of that once as a plug-and-play service. Future projects (legal, medical, internal docs) spin this up and only write their wrapper / business logic on top.
 
 ---
 
@@ -14,90 +14,132 @@ Every RAG project needs the same infrastructure: vector storage, embeddings, rer
 
 ### Ingest pipeline
 
-1. Client sends document to `POST /v1/documents`
-2. API chunks the text (structure-aware, paragraph boundaries, configurable size/overlap)
-3. **Contextual Chunk Headers (CCH)**: document title + metadata are prepended to each chunk before embedding (e.g. `[React Documentation | source: docs] chunk text...`). This gives the embedding model document-level context per chunk (~28% retrieval improvement). The stored chunk keeps the original text for display.
-4. API embeds all enriched chunks in one batch via TEI (`POST /embed`)
-5. API stores document + chunks + vectors + tsvector in PostgreSQL in a **single atomic transaction** - if embedding fails, nothing is committed
-6. Graph entities/relations are created separately via `/v1/concepts` and `/v1/relations`
+1. Client sends document to `POST /v1/documents`.
+2. API chunks the text (paragraph boundaries, configurable `CHUNK_SIZE` / `CHUNK_OVERLAP`). Each chunk also carries a markdown header path breadcrumb (`Section > Subsection`) computed at ingest (Phase 3c).
+3. **Contextual Chunk Headers (CCH).** Each chunk's `indexed_content` is built as `[title | metadata] [Header > Path] <chunk text>`. This is the only form fed to the embedder and to the BM25 index. The original raw chunk text is stored in `chunks.content` for display and reconstruction.
+4. API embeds all `indexed_content` strings in one batch via TEI (`POST /embed`).
+5. API stores document + chunks + vectors in Postgres in a **single atomic transaction**. The BM25 index updates automatically via ParadeDB `pg_search` because the index is defined on `chunks.indexed_content`.
+6. If LightRAG is configured (Memgraph + a reachable LLM), the document is also passed to LightRAG for entity-and-relation extraction. LightRAG writes the entity nodes (`:base` label) and edges (`DIRECTED` type) into Memgraph, plus its KV store on disk under `/app/lightrag_data`. This call is awaited inline so retrieval immediately sees graph hits, but failure does NOT block document creation: the rag-base hybrid + rerank path still works.
+7. Test-only escape hatch: header `X-LightRAG-Ingest: false` skips the LightRAG step (used by tests that don't assert on graph behavior to avoid paying ~1.5 minutes of LLM time per ingest).
 
-### Retrieval pipeline
+### Retrieval pipeline (`POST /v1/search`)
 
-1. Client sends query to `POST /v1/search`
-2. API embeds the query via TEI
-3. Three retrievers run **in parallel**:
-   - **Semantic**: pgvector cosine similarity (`embedding <=> query_vector`) - finds content that means similar things
-   - **Keyword**: PostgreSQL tsvector full-text search (`tsv @@ websearch_to_tsquery`) - finds exact term matches
-   - **Graph**: Memgraph Cypher traversal - expands entities found in the query by 1-2 hops to find related concepts
-4. Results merged via **RRF** (Reciprocal Rank Fusion): `score(d) = sum(1/(60 + rank_i))` per retriever - results found by multiple retrievers get boosted
-5. Top N candidates sent to TEI reranker (`POST /rerank`) - a cross-encoder that scores query-document pairs much more accurately than cosine similarity
-6. Final top K returned to client
+1. Client sends query.
+2. API embeds the query via TEI (`POST /embed`).
+3. Up to **three retrievers run in parallel**:
+   - **Semantic**: pgvector cosine similarity (`embedding <=> query_vector`) over `chunks.embedding`.
+   - **Keyword**: ParadeDB `pg_search` BM25 (`indexed_content @@@ <query>`) - real BM25 with IDF, length normalization, and term-frequency saturation, all evaluated by Tantivy embedded in Postgres.
+   - **Graph** (optional, requires Memgraph + LLM): the LLM extracts entity names from the query in concise mode; we Cypher-match those names plus their 1-hop neighbors in Memgraph; we collect the matched entities' `source_id` fields, split on `<SEP>` to recover LightRAG chunk hashes, look those up in LightRAG's `text_chunks` KV to find the original `(full_doc_id, chunk_order_index)` pairs, then run a doc-restricted semantic search over those documents. The resulting chunks are tagged `source="graph"`.
+4. Results merged via **Reciprocal Rank Fusion** (RRF) with the standard `1 / (60 + rank)` formula. Results that surface from multiple retrievers get boosted; this is what makes hybrid retrieval beat any single channel.
+5. Top `rerank_candidates` (default 50) are cross-encoder-reranked via TEI (`POST /rerank`) - the most accurate but slowest scorer, run last on a bounded candidate pool.
+6. Final `top_k` returned.
 
-### Why this order
+### Graph-only fast mode (`POST /v1/search/graph`)
 
-- Parallel fan-out: each retriever catches what others miss (proven 5-15% better than single retriever)
-- RRF before reranking: the reranker needs to see ALL candidates to make the best decision
-- Rerank last: cross-encoder is the most accurate scoring but slowest, so only run it on the merged top-N, not on everything
+A separate endpoint that bypasses pgvector / BM25 / RRF / cross-encoder rerank entirely:
+
+1. **NER**: GLiNER (`knowledgator/gliner-multitask-v1.0`) runs over the query string. No LLM call at query time.
+2. **Match**: each NER hit is matched to a `:base` node in Memgraph by `entity_id` case-insensitive. If `fuzzy=true`, falls back to `CONTAINS`.
+3. **Subgraph**: 0/1/2-hop traversal over the matched seeds. Two queries (nodes then edges) to dodge a Memgraph quirk where path-comprehension over `r.description` collapsed across edges.
+4. **Rank**: `degree` (seeds first, then non-seeds by degree desc) or `none` (preserve match order).
+5. **Bridge to chunks**: each node carries `source_id = "chunk-<hash><SEP>chunk-<hash2>..."`. Split on `<SEP>`, look up hashes in LightRAG's `text_chunks` KV, parse `full_doc_id="doc_<int>"` and `chunk_order_index`, then resolve to `chunks.id` via the `(document_id, chunk_index)` unique pair in Postgres.
+6. **Return**: structured `{matched_entities, subgraph: {nodes, edges}, chunks, trace}` payload.
+
+This endpoint is the right tool when latency matters (no embedding, no LLM, no rerank), when the query is entity-anchored (a place, a person, a product), or when callers want auditability over the graph traversal.
+
+### Why the order in the hybrid endpoint
+
+- Parallel fan-out in stage 1: each retriever catches what others miss.
+- RRF before reranking: the reranker needs to see ALL candidates to make the best decision.
+- Rerank last: cross-encoder is the most accurate scoring but slowest, so only run it on the merged top-N, not on everything.
 
 ---
 
 ## Containers
 
-### postgres (pgvector/pgvector:0.8.2-pg17)
-- **Port**: 5433 host → 5432 internal (configurable via `POSTGRES_PORT`)
-- **Extensions**: vector (pgvector 0.8.2), pg_trgm (fuzzy matching)
-- **Schema**: `documents` table, `chunks` table (with `embedding vector(1024)` and `tsv tsvector` columns)
-- **Indexes**: HNSW on `chunks.embedding` (cosine distance), GIN on `chunks.tsv` (full-text), GIN on `documents.metadata` (JSONB)
-- **Volume**: `ragbase_pgdata` (named Docker volume)
-- **Init**: `postgres/init.sql` runs on first boot only via `/docker-entrypoint-initdb.d/`
+### postgres (paradedb/paradedb:0.23.1-pg17)
+
+- **Port**: 5433 host -> 5432 internal (configurable via `POSTGRES_PORT`).
+- **Extensions** (loaded by `postgres/init.sql`):
+  - `vector` (pgvector): vector type + HNSW index.
+  - `pg_search` (ParadeDB / Tantivy): real BM25 inverted index. Replaces the older `tsvector` + `ts_rank` keyword approach.
+  - `pg_trgm`: trigram similarity (kept available for fuzzy queries; not on the hot path).
+- **Schema** (see `postgres/init.sql`):
+  - `documents (id, title, content, metadata jsonb, created_at, updated_at)`
+  - `chunks (id, document_id, chunk_index, content, indexed_content, token_count, embedding vector(1024), metadata jsonb, created_at)`
+- **Indexes**:
+  - HNSW on `chunks.embedding` (cosine distance) with `m=16, ef_construction=64`.
+  - `idx_chunks_bm25` on `chunks.indexed_content` via `pg_search` (`USING bm25 (id, indexed_content) WITH (key_field = 'id')`).
+  - GIN on `documents.metadata`.
+  - Unique on `(chunks.document_id, chunks.chunk_index)`.
+- **Persistence**: bind-mounted to `./data/postgres` (host) -> `/var/lib/postgresql/data` (container). `PGDATA=/var/lib/postgresql/data/pgdata` to dodge the initdb-on-existing-dir issue.
+- **Init**: `postgres/init.sql` runs on first boot only via `/docker-entrypoint-initdb.d/`.
 
 ### embedding (ghcr.io/huggingface/text-embeddings-inference:cpu-1.9)
-- **Port**: 8081 host → 80 internal (configurable via `EMBEDDING_PORT`)
-- **Default model**: `Snowflake/snowflake-arctic-embed-l-v2.0` (568M params, 1024 dims)
-- **Model cache**: host dir `EMBEDDING_MODELS_DIR` mounted at `/data` inside container
+
+- **Port**: 8081 host -> 80 internal (configurable via `EMBEDDING_PORT`).
+- **Default model**: `Snowflake/snowflake-arctic-embed-l-v2.0` (568M params, 1024 dims). On this development machine the model is set to `BAAI/bge-m3` (also 1024 dims) via `.env`. Both are drop-in compatible from the api perspective.
+- **Model cache**: host dir `EMBEDDING_MODELS_DIR` mounted at `/data` inside the container.
 - **First boot**: downloads model from HuggingFace Hub (~1.2 GB). Takes 1-3 min. Cached after.
-- **TEI endpoints**: `POST /embed`, `POST /v1/embeddings` (OpenAI-compatible), `GET /health`, `GET /info`
+- **TEI endpoints**: `POST /embed`, `POST /v1/embeddings` (OpenAI-compatible), `GET /health`, `GET /info`.
 
 ### reranker (ghcr.io/huggingface/text-embeddings-inference:cpu-1.9)
-- **Port**: 8082 host → 80 internal (configurable via `RERANK_PORT`)
-- **Default model**: `BAAI/bge-reranker-v2-m3` (568M params, multilingual)
-- **Docker profile**: `rerank` - only starts with `docker compose --profile rerank up -d`
-- **Optional**: API works without it, skips reranking step
-- **TEI endpoints**:
-  - `POST /rerank` - request: `{"query": "...", "texts": ["...", "..."]}` → response: `[{"index": 0, "score": 0.95}, ...]`
-  - `GET /health`, `GET /info`
+
+- **Port**: 8082 host -> 80 internal (configurable via `RERANK_PORT`).
+- **Default model**: `BAAI/bge-reranker-v2-m3` (568M params, multilingual).
+- **Docker profile**: `rerank` - only starts with `docker compose --profile rerank up -d`.
+- **Optional**: api detects its absence and skips the rerank step gracefully.
+- **TEI endpoints**: `POST /rerank` (request: `{"query": "...", "texts": ["...", "..."]}` -> `[{"index": 0, "score": 0.95}, ...]`), `GET /health`, `GET /info`.
 
 ### memgraph (memgraph/memgraph-mage:3.9.0)
-- **Port**: 7687 host → 7687 internal (configurable via `MEMGRAPH_PORT`)
-- **Protocol**: Bolt only (no REST). Connected via `neo4j` Python async driver with `bolt://memgraph:7687`
-- **Docker profile**: `graph` - only starts with `docker compose --profile graph up -d`
-- **Optional**: API works without it, graph endpoints return 503
-- **Algorithms** (via MAGE):
+
+- **Port**: 7687 host -> 7687 internal (configurable via `MEMGRAPH_PORT`).
+- **Protocol**: Bolt only (no REST). The api container connects via the `neo4j` Python async driver pointing at `bolt://memgraph:7687`.
+- **Docker profile**: `graph` - only starts with `docker compose --profile graph up -d`.
+- **Optional**: api detects its absence and: (a) graph endpoints return 503, (b) the search graph channel is silently disabled, (c) LightRAG ingest is skipped.
+- **Algorithms via MAGE**:
   - `CALL pagerank.get() YIELD node, rank`
   - `CALL community_detection.get() YIELD node, community_id`
   - BFS shortest path: `MATCH p = (a)-[*BFS]-(b) RETURN p`
-- **Volume**: `ragbase_mgdata` (named Docker volume)
-- **Constraints**: unique constraint on `Concept.name` (created at API startup)
+- **Persistence**: bind-mounted to `./data/memgraph` (host) -> `/var/lib/memgraph` (container).
+- **First-boot prereq**: Memgraph runs as UID 101 inside the container. The host bind dir must be owned by 101 or Memgraph will SIGSEGV at startup with banner-only logs:
+  ```bash
+  docker run --rm -v "$PWD/data/memgraph":/d alpine chown -R 101:101 /d
+  ```
+- **Schema**:
+  - LightRAG-managed entity nodes (`:base` label) with properties `{entity_id, entity_type, description, source_id}` where `source_id = "chunk-<hash><SEP>chunk-<hash2>..."`.
+  - LightRAG-managed edges (`DIRECTED` type) with `{description, keywords, weight, source_id}`.
+  - The legacy `Concept` / typed-relation API (`/v1/concepts`, `/v1/relations`, `/v1/graph/*`) writes `:Concept` nodes with custom relation labels, kept for tooling and direct graph access alongside the LightRAG-managed graph.
+  - `:Concept(name)` unique constraint is created at api startup.
 
 ### api (custom, python:3.12-slim-bookworm)
-- **Port**: 5050 host → 8000 internal (configurable via `API_PORT`)
-- **Stack**: FastAPI, asyncpg (Postgres), httpx (TEI), neo4j async driver (Memgraph), uvicorn + uvloop
-- **Depends on**: postgres (healthy) and embedding (healthy) - waits for both before starting
-- **Optional services**: tries to reach reranker and memgraph at startup. If unreachable, logs a warning and disables them. **Does not crash.**
-- **Healthcheck**: `GET /health` on internal port 8000
+
+- **Port**: 5050 host -> 8000 internal (configurable via `API_PORT`).
+- **Stack**: FastAPI, asyncpg (Postgres), httpx (TEI + LLM Responses), neo4j async driver (Memgraph), uvicorn + uvloop. GLiNER (CPU torch) for query-time NER. LightRAG (`lightrag-hku>=1.4.15`) for ingest-time entity/relation extraction.
+- **Depends on**: postgres (healthy) and embedding (healthy) - waits for both before starting.
+- **Optional services**: probes reranker, Memgraph, and LLM endpoint at startup. If unreachable, logs a warning and disables them. **Does not crash.**
+- **Persistence**: LightRAG KV + nano-vectordb files are bind-mounted to `./data/lightrag` (host) -> `/app/lightrag_data` (container). Without this, `docker compose build api` would silently wipe the chunk-hash -> full_doc_id mapping that bridges Memgraph entity nodes back to Postgres chunks.
+- **Healthcheck**: `GET /health` on internal port 8000.
 
 ---
 
 ## Startup order
 
-1. **Postgres** starts. Runs `init.sql` on first boot (creates tables, indexes). Healthcheck: `pg_isready`.
-2. **TEI embed** starts in parallel. Downloads model on first boot (1-3 min). Healthcheck: `GET /health` on port 80.
-3. **TEI rerank** (if `--profile rerank`) starts in parallel. Downloads its own model.
+1. **Postgres** starts first. `init.sql` runs on first boot (creates schema, registers extensions). Healthcheck: `pg_isready`. Start period: 30s.
+2. **TEI embed** starts in parallel. Downloads model on first boot (1-3 min). Healthcheck: `GET /health`. Start period: 180s. Retries: 60.
+3. **TEI rerank** (if `--profile rerank`) starts in parallel. Same download behavior.
 4. **Memgraph** (if `--profile graph`) starts in parallel.
-5. **API** starts **last** - Docker `depends_on` waits for Postgres and TEI embed to be healthy.
-6. On startup, API probes reranker and memgraph. If unreachable → logs warning, sets them to disabled. If reachable → connects.
+5. **API** starts last. Docker `depends_on` waits for Postgres and TEI embed to be healthy.
+6. On startup, the api probes reranker, Memgraph, and the LLM endpoint:
+   - Reachable -> connects, logs info.
+   - Unreachable -> logs warning, disables, continues.
+   - **API never crashes due to missing optional services.**
+7. The GLiNER model is lazy-loaded on the first `/v1/search/graph` call (not at startup), so the api comes up fast even on a cold cache.
 
-**If the reranker finishes downloading after the API starts**: `docker compose restart api`
+If the reranker finishes downloading after the api starts:
+```bash
+docker compose restart api
+```
 
 ---
 
@@ -108,7 +150,7 @@ OpenAPI docs: `http://localhost:5050/docs`
 
 ### POST /v1/documents
 
-Ingest a document. Chunks it, embeds each chunk, stores atomically.
+Ingest a document. Chunks it, embeds each chunk's `indexed_content`, stores everything atomically. If LightRAG is configured, also extracts entities/relations into Memgraph + LightRAG KV.
 
 **Request:**
 ```json
@@ -126,14 +168,17 @@ Ingest a document. Chunks it, embeds each chunk, stores atomically.
   "title": "React Documentation",
   "content": "React is a JavaScript library for building user interfaces...",
   "metadata": {"source": "docs", "language": "en"},
-  "created_at": "2026-04-11T10:29:22.526748Z",
-  "updated_at": "2026-04-11T10:29:22.526748Z",
+  "created_at": "2026-04-27T10:29:22.526748Z",
+  "updated_at": "2026-04-27T10:29:22.526748Z",
   "chunk_count": 1
 }
 ```
 
+**Headers:**
+- `X-LightRAG-Ingest: false` skips LightRAG entity extraction (test-only escape hatch).
+
 **Error responses:**
-- `422` - empty title or empty content
+- `422` - empty title or empty content.
 
 ### GET /v1/documents?offset=0&limit=20
 
@@ -160,18 +205,18 @@ Get a document with all its chunks.
 ```
 
 **Error responses:**
-- `404` - document not found
+- `404` - document not found.
 
 ### DELETE /v1/documents/{id}
 
-Delete document and all its chunks (CASCADE). Returns `204 No Content`.
+Delete document and all its chunks (CASCADE). Returns `204 No Content`. Does NOT delete LightRAG-managed graph nodes (those persist by design and may be referenced by other documents).
 
 **Error responses:**
-- `404` - document not found
+- `404` - document not found.
 
 ### POST /v1/search
 
-Hybrid search: semantic + keyword + graph expansion + reranking.
+Hybrid search: semantic + keyword + graph -> RRF -> optional rerank.
 
 **Request:**
 ```json
@@ -192,7 +237,7 @@ Hybrid search: semantic + keyword + graph expansion + reranking.
 | `rerank` | bool | true | Use cross-encoder reranking (falls back if reranker disabled) |
 | `rerank_candidates` | int | 50 | How many RRF-merged results to send to reranker |
 | `min_score` | float | 0.0 | Minimum cosine similarity for semantic results |
-| `include_graph` | bool | true | Include graph expansion (ignored if Memgraph disabled) |
+| `include_graph` | bool | true | Include the LightRAG graph channel (ignored if Memgraph or LLM disabled) |
 
 **Response (200):**
 ```json
@@ -221,11 +266,61 @@ Vector-only search. Same request/response shape. No keyword, graph, or reranking
 
 ### POST /v1/search/keyword
 
-Keyword-only search. Same request/response shape. No vector, graph, or reranking.
+Keyword-only search (BM25 over `indexed_content`). Same request/response shape. No vector, graph, or reranking.
+
+### POST /v1/search/graph
+
+Graph-only fast-mode retrieval. NER (GLiNER) -> Memgraph entity match -> 0/1/2-hop traversal -> structured response. Bypasses pgvector, BM25, RRF, and the cross-encoder reranker entirely. No LLM at query time.
+
+**Request:**
+```json
+{
+  "query": "what does Acme Robotics work on?",
+  "max_entities": 8,
+  "hops": 1,
+  "ranking": "degree",
+  "top_k_chunks": 20,
+  "fuzzy": true,
+  "ner_labels": null
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `query` | string | *(required)* | Search query text |
+| `max_entities` | int | 8 | Cap on NER hits to consider as seeds |
+| `hops` | int | 1 | Subgraph traversal depth (0, 1, 2) |
+| `ranking` | enum | `"degree"` | Node ranking strategy: `"degree"` or `"none"` |
+| `top_k_chunks` | int | 20 | Max chunks to bridge from the subgraph |
+| `fuzzy` | bool | true | Fall back to CONTAINS match when exact_ci finds nothing |
+| `ner_labels` | list[str]\|null | null | Override default GLiNER labels (`person`, `organization`, `location`, ...) |
+
+**Response (200):**
+```json
+{
+  "query": "what does Acme Robotics work on?",
+  "matched_entities": [
+    {"id": "Acme Robotics", "name": "Acme Robotics", "type": "ORGANIZATION", "match_score": 0.94, "match_method": "exact_ci", "source_phrase": "Acme Robotics"}
+  ],
+  "subgraph": {
+    "nodes": [{"id": "Acme Robotics", "name": "Acme Robotics", "type": "ORGANIZATION", "description": "...", "degree": 3}],
+    "edges": [{"source": "Acme Robotics", "target": "Alice Chen", "relation": "EMPLOYS", "weight": 1.0, "keywords": "..."}]
+  },
+  "chunks": [
+    {"chunk_id": 17, "doc_id": 5, "lightrag_chunk_hash": "chunk-abc123...", "text": "...", "source_entities": ["Acme Robotics"]}
+  ],
+  "trace": {
+    "latency_ms": 412.5, "ner_ms": 88.4, "graph_ms": 51.2, "chunk_bridge_ms": 272.9,
+    "n_ner_entities": 1, "n_matched_nodes": 1, "n_subgraph_nodes": 4, "n_subgraph_edges": 3
+  }
+}
+```
+
+200 with empty `matched_entities` and `chunks` when NER finds nothing or no graph nodes match. 503 only when a hard infra dep is unreachable (Memgraph driver missing, NER service not initialized).
 
 ### POST /v1/concepts
 
-Create or update a concept node in the knowledge graph. **Upserts by name** - if a concept with the same name exists, it updates type/description/metadata instead of creating a duplicate.
+Create or update a concept node in the knowledge graph (`:Concept` label, distinct from LightRAG's `:base` entities). Upserts by name - if a concept with the same name exists, it updates type/description/metadata instead of creating a duplicate.
 
 **Request:**
 ```json
@@ -256,8 +351,8 @@ Get a concept with all its outgoing relations.
 ```
 
 **Error responses:**
-- `404` - concept not found
-- `503` - Memgraph is disabled
+- `404` - concept not found.
+- `503` - Memgraph is disabled.
 
 ### DELETE /v1/concepts/{id}
 
@@ -265,7 +360,7 @@ Delete concept and all its edges (DETACH DELETE). Returns `204`.
 
 ### POST /v1/relations
 
-Create a typed directed edge between two concepts (by name).
+Create a typed directed edge between two `:Concept` nodes (by name).
 
 **Request:**
 ```json
@@ -273,9 +368,9 @@ Create a typed directed edge between two concepts (by name).
 ```
 
 **Error responses:**
-- `400` - self-referencing relation (source_name == target_name)
-- `404` - one or both concepts not found
-- `503` - Memgraph is disabled
+- `400` - self-referencing relation (source_name == target_name).
+- `404` - one or both concepts not found.
+- `503` - Memgraph is disabled.
 
 ### GET /v1/relations?concept_name=React
 
@@ -287,7 +382,7 @@ Delete a relation. Returns `204`.
 
 ### GET /v1/graph/neighbors/{concept_id}?depth=2
 
-Multi-hop neighborhood traversal. Returns all concepts within N hops (max 5).
+Multi-hop neighborhood traversal over the `:Concept` graph. Returns all concepts within N hops (max 5).
 
 **Response (200):**
 ```json
@@ -311,11 +406,11 @@ Shortest path between two concepts (BFS).
 ```
 
 **Error responses:**
-- `404` - no path exists between the two concepts
+- `404` - no path exists between the two concepts.
 
 ### GET /v1/graph/communities
 
-Louvain community detection. Returns every concept with its community ID.
+Louvain community detection over the `:Concept` graph. Returns every concept with its community ID.
 
 **Response (200):**
 ```json
@@ -346,8 +441,8 @@ Embed text(s) directly via TEI. Passthrough.
 **Response (200):**
 ```json
 {
-  "embeddings": [[0.23, -0.41, ...], [0.11, 0.55, ...]],
-  "model": "Snowflake/snowflake-arctic-embed-l-v2.0",
+  "embeddings": [[0.23, -0.41, "..."], [0.11, 0.55, "..."]],
+  "model": "BAAI/bge-m3",
   "dimensions": 1024
 }
 ```
@@ -370,7 +465,7 @@ Rerank candidates directly via TEI. Passthrough.
 ```
 
 **Error responses:**
-- `503` - reranker is disabled
+- `503` - reranker is disabled.
 
 ### GET /health
 
@@ -383,7 +478,7 @@ Overall status: `"ok"` if all non-disabled services are healthy, `"degraded"` ot
 
 ### GET /health/models
 
-Returns full model info from TEI for both embedding and reranker (model ID, dtype, max tokens, version, etc.).
+Returns full model info from TEI for both embedding and reranker (model id, dtype, max tokens, version, etc.).
 
 ---
 
@@ -393,18 +488,18 @@ Returns full model info from TEI for both embedding and reranker (model ID, dtyp
 |---|---|---|---|
 | `POSTGRES_DB` | `knowledge` | no | Database name |
 | `POSTGRES_USER` | `knowledge` | no | Database user |
-| `POSTGRES_PASSWORD` | -| **yes** | Database password |
+| `POSTGRES_PASSWORD` | - | **yes** | Database password |
 | `POSTGRES_PORT` | `5433` | no | Host port for Postgres (5433 to avoid host Postgres conflicts) |
 | `API_PORT` | `5050` | no | Host port for API |
 | `API_WORKERS` | `1` | no | Uvicorn workers |
 | `API_LOG_LEVEL` | `info` | no | Log level (debug, info, warning, error) |
-| `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | no | HuggingFace embedding model ID |
+| `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | no | HuggingFace embedding model id |
 | `EMBEDDING_PORT` | `8081` | no | Host port for TEI embed |
-| `EMBEDDING_MODELS_DIR` | -| **yes** | Absolute host path for embedding model cache |
+| `EMBEDDING_MODELS_DIR` | - | **yes** | Absolute host path for embedding model cache |
 | `RERANK_ENABLED` | `true` | no | Whether API tries to connect to reranker |
-| `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | no | HuggingFace reranker model ID |
+| `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | no | HuggingFace reranker model id |
 | `RERANK_PORT` | `8082` | no | Host port for TEI rerank |
-| `RERANKER_MODELS_DIR` | -| **yes** | Absolute host path for reranker model cache |
+| `RERANKER_MODELS_DIR` | - | **yes** | Absolute host path for reranker model cache |
 | `MEMGRAPH_ENABLED` | `true` | no | Whether API tries to connect to Memgraph |
 | `MEMGRAPH_PORT` | `7687` | no | Host port for Memgraph Bolt |
 | `HNSW_M` | `16` | no | HNSW index build param (higher = more connections per node) |
@@ -415,79 +510,73 @@ Returns full model info from TEI for both embedding and reranker (model ID, dtyp
 | `DEFAULT_MIN_SCORE` | `0.40` | no | Default minimum similarity score |
 | `CHUNK_SIZE` | `512` | no | Words per chunk (lower = more precise retrieval, more chunks) |
 | `CHUNK_OVERLAP` | `50` | no | Overlap words between chunks |
-| `PGDATA_VOLUME` | `ragbase_pgdata` | no | Docker named volume for Postgres data |
-| `MEMGRAPH_VOLUME` | `ragbase_mgdata` | no | Docker named volume for Memgraph data |
+| `LLM_BASE_URL` | `http://host.docker.internal:8000` | no | OpenAI Responses API endpoint used by LightRAG (ingest-time entity extraction) and the search graph channel (query-time entity-name extraction) |
+| `LLM_MODEL` | `Qwen3.6-27B-AWQ4` | no | LLM model id sent in the Responses API payload |
+| `LLM_API_KEY` | *(empty)* | no | Bearer token for the LLM endpoint (vLLM does not require one) |
+| `LLM_ENABLE_THINKING` | `false` | no | When false, sends `chat_template_kwargs.enable_thinking=false`. On Qwen3.6-27B-AWQ4 this cuts a 3-word answer from ~684 output tokens / 33s to 3 tokens / 0.7s |
+
+Persistence is bind-mounted to `./data/{postgres,memgraph,lightrag}`; no env var needed (paths are wired in `docker-compose.yml`).
 
 ---
 
-## Startup order
-
-1. **Postgres** starts first. `init.sql` runs on first boot only (creates schema). Healthcheck: `pg_isready`. Start period: 30s.
-2. **TEI embed** starts in parallel. Downloads model on first boot (1-3 min). Healthcheck: `GET /health`. Start period: 180s. Retries: 60.
-3. **TEI rerank** (if `--profile rerank`) starts in parallel. Same download behavior.
-4. **Memgraph** (if `--profile graph`) starts in parallel.
-5. **API** starts **last** -`depends_on` waits for Postgres and TEI embed to be healthy.
-6. On startup, API probes reranker and memgraph:
-   - Reachable → connects, logs info
-   - Unreachable → logs warning, disables, continues
-   - **API never crashes due to missing optional services**
-
-If the reranker finishes downloading after the API starts:
-```bash
-docker compose restart api
-```
-
 ## Verified behavior
 
-- Ingest is atomic: document + chunks + vectors in one transaction. If embedding fails, nothing is committed.
+- Ingest is atomic: document + chunks + vectors in one Postgres transaction. If embedding fails, nothing is committed.
+- LightRAG ingest is best-effort: if it fails or hangs past its internal timeout, the doc is still committed; only graph extraction is skipped.
 - Chunk inserts use batch `executemany`.
-- Hybrid search runs semantic + keyword in parallel, merges with RRF.
+- Hybrid search runs semantic + keyword (+ graph if enabled) in parallel, merges with RRF.
 - RRF correctly boosts results found by multiple retrievers (dual-match scores ~2x single-match).
 - Reranker amplifies relevance gap: relevant docs score 0.95+, irrelevant score <0.001.
-- Concepts are upserted by name (MERGE) - no duplicates.
+- LightRAG entity nodes are merged across documents by `entity_id` (case-sensitive); re-ingesting the same content as a new doc augments `source_id` rather than duplicating nodes.
+- The `/v1/search/graph` endpoint is read-only against Memgraph, LightRAG KV, and Postgres. It never writes, never mutates LightRAG state.
+- `:Concept` upserts by name (MERGE) - no duplicates.
 - Self-referencing relations are blocked (400).
 - Cypher injection is prevented by sanitizing relation types to `[A-Za-z0-9_]` only.
 - SQL injection is safe (asyncpg parameterized queries throughout).
 - Graph endpoints return 503 when Memgraph is disabled.
 - All ports configurable, all bound to 127.0.0.1 (not exposed to network).
-- HNSW ef_search is set per-connection via pool init (all connections get the setting).
-- Empty/whitespace content produces document with 0 chunks (no crash).
+- HNSW `ef_search` is set per-connection via pool init (all connections get the setting).
+- Empty/whitespace content produces a document with 0 chunks (no crash).
 - Unicode, emoji, CJK characters handled correctly.
 - Document delete cascades to chunks (no orphan data).
 - Deleted documents immediately disappear from search results.
 - 404 returned for non-existent resources on GET and DELETE.
 - 422 returned for invalid input (empty title, empty content, empty query).
 - Empty database returns empty results (no crash).
-- Ingest-then-search: no delay needed, results available immediately.
+- Ingest-then-search: no delay needed for hybrid + rerank channels; the graph channel becomes available as soon as LightRAG ingest completes for that doc.
 - Cross-domain isolation: legal, medical, tech queries each find their own domain.
-- Data persists across `docker compose down`.
-- Data destroyed only by `docker compose down - v`.
-- Model cache persists on host filesystem across container rebuilds.
-- OpenAPI docs auto-generated at `/docs` (21 endpoints).
+- Data persists across `docker compose down`, `docker compose down + up`, `docker compose build api`, and even `docker volume prune` - because all persistent state is on host bind mounts under `./data/`, not in named docker volumes.
+- Data destroyed only by `rm -rf ./data/{postgres,memgraph,lightrag}`.
+- Model cache persists on host filesystem across container rebuilds (separate dirs, separate from `./data/`).
+- OpenAPI docs auto-generated at `/docs`.
 
 ## Recommendations for best retrieval quality
 
-**Contextual Chunk Headers (built-in)**: rag-base automatically prepends document title and metadata to each chunk before embedding. Improves retrieval by ~28%. No configuration needed. Stored chunk text remains original (headers only affect the embedding vector).
+**Contextual Chunk Headers (built-in)**: rag-base automatically prepends the document title, metadata, and the markdown heading breadcrumb to each chunk's `indexed_content` before embedding and BM25 indexing. This is what the embedder and BM25 actually see; the raw chunk text in `chunks.content` is preserved for display. No configuration needed.
 
 **Contextual Retrieval (client-side)**: For further improvement, implement Anthropic's Contextual Retrieval before ingesting. Use an LLM to generate a 50-100 token chunk-specific summary, prepend it to the chunk content, then send to `POST /v1/documents`. Up to 49% fewer retrieval failures. Requires LLM calls at ingest time, so this is a client concern, not built into rag-base.
 
+**Use the right endpoint for the query**:
+- `/v1/search` for general queries where you want recall + precision.
+- `/v1/search/semantic` when paraphrase is the dominant matching mode.
+- `/v1/search/keyword` for queries with rare jargon or exact terms (e.g. statute citations, error codes).
+- `/v1/search/graph` for entity-anchored queries (a place, a person, a product) where latency matters - no LLM at query time.
+
 ## Known limitations
 
-- Graph entity extraction from search queries is naive (word matching). Production use should add NER or LLM-based extraction.
-- Graph results are not yet fused into RRF with chunk results (concepts don't map directly to chunks). Graph expansion enriches retrieval context but doesn't contribute to chunk ranking scores.
-- Chunking uses word count as token approximation. For precise token counting, add a tokenizer.
-- Default chunk size (512 words) means most short documents (<500 words) become a single chunk. Lower `CHUNK_SIZE` for finer-grained retrieval.
-- No authentication. Add a reverse proxy (nginx, caddy) for production.
 - Single-node only. No clustering or replication.
 - TEI CPU image only. For GPU acceleration, swap image tag to CUDA/ROCm variants.
+- No authentication. Add a reverse proxy (nginx, caddy) for production.
+- LightRAG ingest on the local Qwen3.6-27B-AWQ4 reasoning vLLM takes ~1-3 min per chunk with `enable_thinking=false`. Sustainable for ad-hoc ingest; batch ingest pipelines should run LightRAG asynchronously via the `X-LightRAG-Ingest: false` header at ingest time and then bulk-extract later.
+- Memgraph stores metadata as JSON strings (no native dict type). Serialized/deserialized transparently by the api.
 - If reranker profile starts after API, requires `docker compose restart api` to connect.
-- Memgraph stores metadata as JSON strings (no native dict type). Serialized/deserialized transparently.
+- Default chunk size (512 words) means most short documents (<500 words) become a single chunk. Lower `CHUNK_SIZE` for finer-grained retrieval.
 
 ## Port map
 
 | Service | Default port | Notes |
 |---|---|---|
-| *(port 8000)* | 8000 | Deliberately avoided (common for other services) |
+| *(port 8000)* | 8000 | Deliberately avoided (common for other services / vLLM) |
 | Postgres | 5433 | Non-standard to avoid host Postgres conflict |
 | TEI Embed | 8081 | |
 | TEI Rerank | 8082 | |

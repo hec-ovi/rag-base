@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from pgvector.asyncpg import register_vector
 
 from src.config import settings
-from src.routers import concepts, documents, embed, graph, health, rerank, relations, search
+from src.routers import concepts, documents, embed, graph, graph_search, health, rerank, relations, search
 
 logger = logging.getLogger("rag-base")
 
@@ -80,9 +81,63 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.warning("Memgraph unreachable at %s, disabled", settings.memgraph_url)
 
+    # 5. LightRAG (optional — degrade gracefully)
+    # Requires Memgraph (graph storage) and a reachable LLM. If either is missing,
+    # the search graph channel is silently disabled; ingest still stores docs but
+    # skips entity extraction.
+    app.state.lightrag = None
+    app.state.llm_complete = None
+    if app.state.graph_driver and settings.llm_base_url:
+        try:
+            from src.services.llm_responses import make_llm_complete
+            from src.services.lightrag_store import init_lightrag
+            llm_complete = make_llm_complete(
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                api_key=settings.llm_api_key,
+                enable_thinking=settings.llm_enable_thinking,
+            )
+            # Ping the LLM with a tiny call so a misconfigured endpoint fails fast.
+            try:
+                await llm_complete("ping", concise=True)
+                app.state.llm_complete = llm_complete
+                logger.info("LLM endpoint reachable: %s", settings.llm_base_url)
+            except Exception as e:
+                logger.warning("LLM ping failed (%s); LightRAG disabled", e)
+
+            if app.state.llm_complete:
+                lightrag_dir = os.environ.get("LIGHTRAG_WORKING_DIR", "/app/lightrag_data")
+                rag = await init_lightrag(
+                    working_dir=lightrag_dir,
+                    embed_client=app.state.embed_client,
+                    llm_complete=app.state.llm_complete,
+                    memgraph_url=settings.memgraph_url,
+                )
+                app.state.lightrag = rag
+                logger.info("LightRAG ready (working_dir=%s)", lightrag_dir)
+        except Exception as e:
+            logger.warning("LightRAG init failed (%s); graph channel disabled", e)
+
+    # 6. NER service for the Phase 5 graph-only endpoint (optional - degrade gracefully).
+    # Lazy-loaded: the GLiNER model is fetched from disk on the first /v1/search/graph
+    # call, not here. Construction is cheap; we only build the wrapper now so the
+    # router can find it on app.state.
+    app.state.ner_service = None
+    try:
+        from src.services.ner import NERService
+        app.state.ner_service = NERService()
+        logger.info("NER service constructed (model loads on first /v1/search/graph call)")
+    except Exception as e:
+        logger.warning("NER service unavailable (%s); /v1/search/graph will return 503", e)
+
     yield
 
     # ── Shutdown ─────────────────────────────────────────────
+    if app.state.lightrag:
+        try:
+            await app.state.lightrag.finalize_storages()
+        except Exception:
+            pass
     await app.state.db_pool.close()
     await app.state.embed_client.aclose()
     if app.state.rerank_client:
@@ -101,6 +156,7 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(documents.router, prefix="/v1")
 app.include_router(search.router, prefix="/v1")
+app.include_router(graph_search.router, prefix="/v1")
 app.include_router(concepts.router, prefix="/v1")
 app.include_router(relations.router, prefix="/v1")
 app.include_router(graph.router, prefix="/v1")

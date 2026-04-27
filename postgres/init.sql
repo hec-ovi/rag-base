@@ -5,6 +5,7 @@
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS vector;        -- pgvector: vector type + HNSW/IVFFlat
+CREATE EXTENSION IF NOT EXISTS pg_search;     -- ParadeDB pg_search: real BM25 via Tantivy
 CREATE EXTENSION IF NOT EXISTS pg_trgm;       -- trigram similarity for fuzzy matching
 
 -- ── Documents ───────────────────────────────────────────────
@@ -21,24 +22,33 @@ CREATE TABLE documents (
 CREATE INDEX idx_documents_metadata ON documents USING gin (metadata);
 
 -- ── Chunks ──────────────────────────────────────────────────
--- Chunks are fragments of documents, each with a vector and tsvector.
+-- Chunks are fragments of documents, each with a vector and a BM25 index.
+-- Phase 3a swapped tsvector + ts_rank for ParadeDB pg_search BM25 (real
+-- IDF + length normalization + term-frequency saturation), no DB migration.
+-- Phase 3c added indexed_content: the augmented text fed to embedding +
+-- BM25 = "[title | metadata] [header > path] <chunk>". The raw chunk lives
+-- in content unchanged so display + reconstruction stay clean.
 CREATE TABLE chunks (
-    id           BIGSERIAL PRIMARY KEY,
-    document_id  BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    chunk_index  INT NOT NULL,
-    content      TEXT NOT NULL,
-    token_count  INT NOT NULL DEFAULT 0,
-    embedding    vector(1024),
-    tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
-    metadata     JSONB NOT NULL DEFAULT '{}',
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index     INT NOT NULL,
+    content         TEXT NOT NULL,
+    indexed_content TEXT NOT NULL,
+    token_count     INT NOT NULL DEFAULT 0,
+    embedding       vector(1024),
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Foreign key lookup
 CREATE INDEX idx_chunks_document_id ON chunks (document_id);
 
--- Full-text search (keyword retrieval)
-CREATE INDEX idx_chunks_tsv ON chunks USING gin (tsv);
+-- Full-text search (keyword retrieval), real BM25 via pg_search.
+-- Indexes indexed_content (title + header path + chunk) so BM25 sees the
+-- same disambiguating prefix the embedder sees.
+CREATE INDEX idx_chunks_bm25 ON chunks
+    USING bm25 (id, indexed_content)
+    WITH (key_field = 'id');
 
 -- Vector similarity search (semantic retrieval)
 -- HNSW index — created after first data load is more efficient,

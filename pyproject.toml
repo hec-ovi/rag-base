@@ -2,6 +2,9 @@
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "slow: tests that take more than ~30s (LightRAG ingest, real LLM extraction). Deselect with -m 'not slow'.",
+]
 
 [tool.pytest-asyncio]
 mode = "auto"

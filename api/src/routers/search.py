@@ -1,18 +1,59 @@
 """Hybrid search endpoint — semantic + keyword + graph → RRF → rerank."""
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Request
 
-from src.config import settings
 from src.models.search import SearchRequest, SearchResponse, SearchResult
 from src.services.embedding import embed_single
 from src.services.fusion import reciprocal_rank_fusion
 from src.services.keyword_search import search_keyword
+from src.services.lightrag_store import extract_query_entities, find_docs_via_graph
 from src.services.reranking import rerank
-from src.services.vector_store import search_semantic
+from src.services.vector_store import search_semantic, search_semantic_in_docs
 
 router = APIRouter(tags=["search"])
+logger = logging.getLogger(__name__)
+
+
+async def _graph_channel(
+    rag,
+    graph_driver,
+    llm_complete,
+    pool,
+    query: str,
+    query_vector: list[float],
+    top_k: int,
+    min_score: float,
+) -> list[dict]:
+    """Run the LightRAG-backed graph retrieval channel.
+
+    Pipeline:
+      1. LLM extracts entity names from the query (concise mode).
+      2. Cypher into Memgraph: find entities matching those names plus 1-hop
+         neighbors, return their LightRAG chunk hashes.
+      3. Bridge those chunk hashes via LightRAG's text_chunks KV to our doc ids.
+      4. Semantic search restricted to those doc ids; results tagged source="graph".
+
+    Returns [] on any failure or if no graph hits found. The other retrieval
+    channels are unaffected.
+    """
+    if rag is None or graph_driver is None or llm_complete is None:
+        return []
+    try:
+        names = await extract_query_entities(llm_complete, query)
+        if not names:
+            return []
+        doc_ids = await find_docs_via_graph(rag, graph_driver, names)
+        if not doc_ids:
+            return []
+        return await search_semantic_in_docs(
+            pool, query_vector, doc_ids, top_k=top_k, min_score=min_score, source_label="graph"
+        )
+    except Exception as e:
+        logger.warning("Graph channel failed: %s", e)
+        return []
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -21,6 +62,9 @@ async def hybrid_search(body: SearchRequest, request: Request):
     pool = request.app.state.db_pool
     embed_client = request.app.state.embed_client
     rerank_client = request.app.state.rerank_client
+    graph_driver = getattr(request.app.state, "graph_driver", None)
+    lightrag = getattr(request.app.state, "lightrag", None)
+    llm_complete = getattr(request.app.state, "llm_complete", None)
 
     candidates = body.rerank_candidates if body.rerank and rerank_client else body.top_k
     retrievers_used = []
@@ -28,22 +72,19 @@ async def hybrid_search(body: SearchRequest, request: Request):
     # 1. Embed the query
     query_vector = await embed_single(embed_client, body.query)
 
-    # 2. Fan out: semantic + keyword (+ graph) in parallel
-    tasks = [
+    # 2. Fan out: semantic + keyword + graph in parallel
+    tasks: list = [
         search_semantic(pool, query_vector, top_k=candidates, min_score=body.min_score),
         search_keyword(pool, body.query, top_k=candidates),
     ]
-
-    # Graph expansion (if enabled and requested)
-    graph_results = []
-    if body.include_graph and request.app.state.graph_driver:
-        # Simple entity extraction: look for capitalized multi-word terms
-        # A production system would use NER here
-        words = body.query.split()
-        entity_candidates = [w for w in words if len(w) > 2]
-        if entity_candidates:
-            from src.services.graph_store import graph_search_expansion
-            tasks.append(graph_search_expansion(request.app.state.graph_driver, entity_candidates))
+    graph_enabled = bool(body.include_graph and lightrag and graph_driver and llm_complete)
+    if graph_enabled:
+        tasks.append(
+            _graph_channel(
+                lightrag, graph_driver, llm_complete, pool,
+                body.query, query_vector, candidates, body.min_score,
+            )
+        )
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -59,11 +100,11 @@ async def hybrid_search(body: SearchRequest, request: Request):
         ranked_lists.append(keyword_results)
         retrievers_used.append("keyword")
 
-    if len(results) > 2 and not isinstance(results[2], Exception) and results[2]:
-        graph_results = results[2]
-        retrievers_used.append("graph")
-        # Graph results don't have chunk_ids directly — skip for RRF if no chunk mapping
-        # TODO: link concepts to chunks for graph→RRF integration
+    if graph_enabled:
+        graph_results = results[2] if not isinstance(results[2], Exception) else []
+        if graph_results:
+            ranked_lists.append(graph_results)
+            retrievers_used.append("graph")
 
     # 3. Merge with RRF
     if not ranked_lists:

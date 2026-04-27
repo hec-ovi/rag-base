@@ -3,7 +3,7 @@ services:
   # ── PostgreSQL + pgvector ────────────────────────────────
   # Starts FIRST. Everything depends on it.
   postgres:
-    image: pgvector/pgvector:0.8.2-pg17
+    image: paradedb/paradedb:0.23.1-pg17
     restart: unless-stopped
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
@@ -11,8 +11,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-knowledge}
       POSTGRES_USER: ${POSTGRES_USER:-knowledge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # PGDATA points to a subdir so initdb does not fight the bind-mount root.
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-knowledge}"]
@@ -69,7 +71,7 @@ services:
     ports:
       - "127.0.0.1:${MEMGRAPH_PORT:-7687}:7687"
     volumes:
-      - mgdata:/var/lib/memgraph
+      - ./data/memgraph:/var/lib/memgraph
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
       interval: 5s
@@ -110,6 +112,19 @@ services:
       # Server
       API_WORKERS: ${API_WORKERS:-1}
       API_LOG_LEVEL: ${API_LOG_LEVEL:-info}
+      # LLM (reached via host gateway; vLLM running on host)
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000}
+      LLM_MODEL: ${LLM_MODEL:-Qwen3.6-27B-AWQ4}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # LightRAG KV store + nano-vectordb files. Bind-mounted (per the
+      # no-named-volumes rule) so container rebuilds do not silently wipe
+      # the source_id <-> full_doc_id mapping that bridges Memgraph entity
+      # nodes back to our documents/chunks.
+      - ./data/lightrag:/app/lightrag_data
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,9 +136,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-
-volumes:
-  pgdata:
-    name: ${PGDATA_VOLUME:-ragbase_pgdata}
-  mgdata:
-    name: ${MEMGRAPH_VOLUME:-ragbase_mgdata}

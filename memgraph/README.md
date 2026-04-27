@@ -30,7 +30,14 @@ Bolt protocol only (no REST API). The API container connects using the `neo4j` P
 
 ## Persistence
 
-Data stored in a named Docker volume (`ragbase_mgdata`). Survives `docker compose down`.
+Data is bind-mounted to `./data/memgraph` in the rag-base repo (`/var/lib/memgraph` inside the container). Survives `docker compose down` AND `docker volume prune`. Wipe by deleting `./data/memgraph`. The `./data/` tree is gitignored.
+
+**First-boot prereq.** Memgraph runs as UID 101 inside the container. The host bind dir must be owned by 101 or Memgraph SIGSEGVs at startup with banner-only logs:
+
+```bash
+mkdir -p ./data/memgraph
+docker run --rm -v "$PWD/data/memgraph":/d alpine chown -R 101:101 /d
+```
 
 ## Optional
 

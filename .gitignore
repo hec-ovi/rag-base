@@ -31,4 +31,8 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Docker data (volumes are managed by Docker, not stored here)
+# Docker bind-mount data (postgres + memgraph + lightrag live under ./data/, never commit)
+/data/
+
+# Integration validation runner ephemeral state (regenerated per session)
+tests/integration_validation/results/

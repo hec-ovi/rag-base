@@ -7,3 +7,15 @@ asyncpg>=0.30,<1
 pgvector>=0.3,<1
 httpx>=0.28,<1
 neo4j>=5.27,<6
+
+# Phase 2: real LightRAG. Pinned >=1.4.14 to close the two 2026 CVEs in the
+# LightRAG API server bundle (we use embedded core, so not exposed, but pin
+# defensively). Pinned <2 for upper bound.
+lightrag-hku>=1.4.15,<2
+# Phase 2: tiktoken is required by LightRAG for token counting in the chunker.
+tiktoken>=0.7,<1
+
+# Phase 5: graph-only fast-mode endpoint. GLiNER drives query-time NER
+# without an LLM call. CPU-only inference; torch is installed separately
+# in the Dockerfile against the CPU index to keep image size manageable.
+gliner>=0.2.26,<0.3

@@ -32,5 +32,13 @@ class Settings(BaseSettings):
     api_workers: int = 1
     api_log_level: str = "info"
 
+    # LLM (used by LightRAG for entity extraction + query-key generation)
+    llm_base_url: str = "http://host.docker.internal:8000"
+    llm_model: str = "Qwen3.6-27B-AWQ4"
+    llm_api_key: str = ""
+    # Disabled by default: see api/src/services/llm_responses.py docstring for the
+    # 50x latency measurement that motivated this default.
+    llm_enable_thinking: bool = False
+
 
 settings = Settings()

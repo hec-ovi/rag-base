@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "purpose": "Phase 1 smoke set for baseline metrics. Not the golden set (which lands after Phase 1 close per tests/golden/CURATION.md). 15 queries against 8 seed docs, each query maps to exactly one expected doc.",
+  "docs": [
+    {
+      "key": "bge_m3",
+      "title": "BGE-M3 multilingual embedding model reference",
+      "content": "BGE-M3 is a multilingual embedding model produced by BAAI. It outputs 1024-dimensional dense vectors and supports an 8192-token context window. Unlike most embedders it can produce dense, sparse, and ColBERT-style multi-vector outputs from one model. License is MIT.",
+      "metadata": {"source": "smoke", "category": "embeddings"}
+    },
+    {
+      "key": "snowflake_arctic",
+      "title": "Snowflake arctic-embed-l v2.0 reference",
+      "content": "Snowflake arctic-embed-l v2.0 is an English-leaning embedding model with 568 million parameters and 1024-dimensional output. It is the rag-base default but is being replaced by BGE-M3 for multilingual coverage.",
+      "metadata": {"source": "smoke", "category": "embeddings"}
+    },
+    {
+      "key": "bge_reranker_v2_m3",
+      "title": "BGE-reranker-v2-m3 cross-encoder reranker",
+      "content": "BGE-reranker-v2-m3 is a multilingual cross-encoder reranker from BAAI built on a MiniLM-class backbone with about 568 million parameters. BEIR NDCG@10 around 51.8 on the standard split. The default rag-base reranker before the Phase 4 swap.",
+      "metadata": {"source": "smoke", "category": "rerankers"}
+    },
+    {
+      "key": "mxbai_rerank_large_v2",
+      "title": "Mixedbread mxbai-rerank-large-v2 cross-encoder",
+      "content": "mxbai-rerank-large-v2 is the Apache 2.0 reranker from Mixedbread released March 2025. 1.5 billion parameters, BEIR average NDCG@10 of 57.49. The Phase 4 SOTA pick for self-hosted reranking in rag-base.",
+      "metadata": {"source": "smoke", "category": "rerankers"}
+    },
+    {
+      "key": "lightrag_dual_level",
+      "title": "LightRAG dual-level retrieval architecture",
+      "content": "LightRAG generates two query keys per question: a low-level entity-oriented key and a high-level theme-oriented key. Both are matched against entity and relation vector stores; one-hop neighbors in the graph are fetched and assembled into LLM context. Modes are naive, local, global, hybrid, and mix.",
+      "metadata": {"source": "smoke", "category": "graph"}
+    },
+    {
+      "key": "rrf_constant_60",
+      "title": "Reciprocal Rank Fusion with k equals 60",
+      "content": "Reciprocal Rank Fusion combines multiple ranked lists using score equals sum of one over k plus rank. The constant k equals 60 traces to Cormack 2009 and is the default in Elasticsearch, OpenSearch, Weaviate, MariaDB, and Vertex AI hybrid search.",
+      "metadata": {"source": "smoke", "category": "fusion"}
+    },
+    {
+      "key": "paradedb_pg_search",
+      "title": "ParadeDB pg_search BM25 extension for Postgres",
+      "content": "ParadeDB pg_search embeds Tantivy inside Postgres to provide real BM25 scoring as an alternative to tsvector ts_rank. Tiger Data pg_textsearch reports 2.4 to 6.5 times faster than ParadeDB at 138 million document scale on 2 to 4 term queries.",
+      "metadata": {"source": "smoke", "category": "keyword"}
+    },
+    {
+      "key": "anthropic_contextual_retrieval",
+      "title": "Anthropic Contextual Retrieval per-chunk LLM blurb",
+      "content": "Anthropic Contextual Retrieval prepends a 50 to 100 token LLM-generated blurb to each chunk before embedding and BM25 indexing. Originally reduced top-20 retrieval failures by 35 percent with embeddings alone, 49 percent with BM25, 67 percent with reranking. Cost is roughly 1 dollar per million document tokens with prompt caching.",
+      "metadata": {"source": "smoke", "category": "chunking"}
+    }
+  ],
+  "queries": [
+    {"query": "What multilingual embedding model produces 1024-dim vectors with 8192 context", "expected_key": "bge_m3"},
+    {"query": "BGE-M3", "expected_key": "bge_m3"},
+    {"query": "Snowflake arctic-embed-l v2.0 dimensions", "expected_key": "snowflake_arctic"},
+    {"query": "What is the rag-base default embedder before BGE-M3", "expected_key": "snowflake_arctic"},
+    {"query": "BGE-reranker-v2-m3 BEIR NDCG", "expected_key": "bge_reranker_v2_m3"},
+    {"query": "MiniLM backbone reranker BAAI 568 million parameters", "expected_key": "bge_reranker_v2_m3"},
+    {"query": "mxbai-rerank-large-v2", "expected_key": "mxbai_rerank_large_v2"},
+    {"query": "Mixedbread Apache 2.0 reranker 1.5B parameters", "expected_key": "mxbai_rerank_large_v2"},
+    {"query": "LightRAG dual-level retrieval low-level high-level keys", "expected_key": "lightrag_dual_level"},
+    {"query": "naive local global hybrid mix query modes", "expected_key": "lightrag_dual_level"},
+    {"query": "Reciprocal Rank Fusion k equals 60 constant Cormack", "expected_key": "rrf_constant_60"},
+    {"query": "RRF default value of k", "expected_key": "rrf_constant_60"},
+    {"query": "ParadeDB pg_search Tantivy BM25 inside Postgres", "expected_key": "paradedb_pg_search"},
+    {"query": "Anthropic Contextual Retrieval 49 percent retrieval failure reduction", "expected_key": "anthropic_contextual_retrieval"},
+    {"query": "per-chunk LLM blurb prompt caching one dollar per million tokens", "expected_key": "anthropic_contextual_retrieval"}
+  ]
+}
