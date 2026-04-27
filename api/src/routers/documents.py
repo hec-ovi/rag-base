@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from src.config import settings
 from src.models.document import DocumentCreate, DocumentDetail, DocumentOut
 from src.services.chunking import chunk_text_with_headers
+from src.services.contextual_retrieval import generate_blurbs
 from src.services.embedding import embed_texts
 from src.services.lightrag_store import lightrag_insert
 from src.services.vector_store import insert_document_with_chunks
@@ -32,6 +33,7 @@ async def create_document(body: DocumentCreate, request: Request):
     pool = request.app.state.db_pool
     embed_client = request.app.state.embed_client
     lightrag = getattr(request.app.state, "lightrag", None)
+    llm_complete = getattr(request.app.state, "llm_complete", None)
     skip_lightrag = request.headers.get("x-lightrag-ingest", "true").lower() == "false"
 
     # 1. Chunk the content with markdown header path tracking (Phase 3c).
@@ -42,10 +44,32 @@ async def create_document(body: DocumentCreate, request: Request):
         body.content, settings.chunk_size, settings.chunk_overlap
     )
 
-    # 2. Build contextual chunk headers (CCH) for embedding + BM25.
+    # 2. Optional Contextual Retrieval blurbs (Anthropic CR, opt-in via
+    # body.contextual_retrieval). When enabled and the LLM endpoint is reachable,
+    # we ask for a 50-100 token "situating" blurb per chunk; vLLM's automatic
+    # prefix caching shares the document KV across the per-chunk calls. On a
+    # per-chunk LLM failure that chunk gets an empty blurb and ingest proceeds.
+    # When the flag is false (default) or no LLM is configured, blurbs are all
+    # empty and the rest of the pipeline behaves byte-identically to before.
+    blurbs: list[str] = ["" for _ in chunk_records]
+    if body.contextual_retrieval:
+        if llm_complete is None:
+            logger.warning(
+                "contextual_retrieval=true but no LLM configured; ingesting without blurbs"
+            )
+        elif chunk_records:
+            blurbs = await generate_blurbs(
+                llm_complete,
+                body.content,
+                [r["content"] for r in chunk_records],
+            )
+
+    # 3. Build contextual chunk headers (CCH) for embedding + BM25.
     # Augmented form fed to the embedder and stored as indexed_content:
-    #   [title | meta_k: meta_v | ...] [Header > Path] <chunk text>
+    #   [title | meta_k: meta_v | ...] [Header > Path] <CR blurb> <chunk text>
     # The header-path bracket is omitted when the chunk lives under no heading.
+    # The CR blurb is omitted when contextual_retrieval is false or the LLM
+    # call failed for this chunk (graceful degrade).
     # Original raw chunk text is stored separately in chunks.content.
     meta_parts = [body.title]
     for k, v in body.metadata.items():
@@ -53,18 +77,19 @@ async def create_document(body: DocumentCreate, request: Request):
     title_meta = " | ".join(meta_parts)
 
     indexed_texts: list[str] = []
-    for record in chunk_records:
+    for record, blurb in zip(chunk_records, blurbs):
+        parts = [f"[{title_meta}]"]
         if record["header_path"]:
-            indexed_texts.append(
-                f"[{title_meta}] [{record['header_path']}] {record['content']}"
-            )
-        else:
-            indexed_texts.append(f"[{title_meta}] {record['content']}")
+            parts.append(f"[{record['header_path']}]")
+        if blurb:
+            parts.append(blurb)
+        parts.append(record["content"])
+        indexed_texts.append(" ".join(parts))
 
-    # 3. Embed all augmented chunks in one batch (if any)
+    # 4. Embed all augmented chunks in one batch (if any)
     vectors = await embed_texts(embed_client, indexed_texts) if indexed_texts else []
 
-    # 4. Build chunk records (raw content + augmented indexed_content)
+    # 5. Build chunk records (raw content + augmented indexed_content)
     chunks = [
         {
             "content": record["content"],
@@ -78,12 +103,12 @@ async def create_document(body: DocumentCreate, request: Request):
         )
     ]
 
-    # 5. Store document + chunks in a single transaction
+    # 6. Store document + chunks in a single transaction
     result = await insert_document_with_chunks(
         pool, body.title, body.content, body.metadata, chunks
     )
 
-    # 6. Feed to LightRAG for entity/relation extraction (best-effort).
+    # 7. Feed to LightRAG for entity/relation extraction (best-effort).
     # Slow on the local reasoning vLLM (1-5 min per chunk) but bounded by
     # lightrag_insert's internal timeout. Failure is logged, not propagated.
     if lightrag is not None and not skip_lightrag:

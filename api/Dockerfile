@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from gliner import GLiNER; GLiNER.from_pretrained('knowledgator/gliner-multitask-v1.0')"
 
 COPY src/ ./src/
+COPY prompts/ ./prompts/
 
 EXPOSE 8000
 

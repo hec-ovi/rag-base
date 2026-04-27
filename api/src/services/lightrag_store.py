@@ -240,22 +240,18 @@ async def lightrag_insert(
 
 # ---------- Query-side: query -> entity names -> graph -> doc_ids ----------
 
-_ENTITY_EXTRACTION_PROMPT = """Extract the named entities from the following question.
-Output ONLY a JSON list of strings (entity names), nothing else.
-If there are no clear entities, output [].
-
-Question: {query}"""
-
 
 async def extract_query_entities(llm_complete: LLMComplete, query: str) -> list[str]:
     """Ask the LLM for entity names mentioned in the query.
 
     Uses concise mode so the model goes direct to JSON without deliberation.
-    Returns empty list on parse failure.
+    Returns empty list on parse failure. Prompt body lives in
+    `api/prompts/query_entity_extraction.md` and is editable without code change.
     """
+    from src.services import prompts
     try:
         text = await llm_complete(
-            _ENTITY_EXTRACTION_PROMPT.format(query=query),
+            prompts.render("query_entity_extraction", query=query),
             concise=True,
         )
     except Exception as e:

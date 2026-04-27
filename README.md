@@ -252,10 +252,12 @@ OpenAPI docs auto-generated at <http://localhost:5050/docs>. Full request/respon
 | 🟢 GLiNER NER for graph-only fast mode (no LLM at query time) | shipped |
 | 🟢 Graph channel results actually merged into RRF (closes the historical search.py:66 TODO) | shipped |
 | 🟢 Graceful degradation: api never crashes on missing optional services | shipped |
-| 🟢 Test gates: every SOTA mechanism has a "did it actually fire?" test | shipped (97/97 passing) |
+| 🟢 Anthropic Contextual Retrieval (`contextual_retrieval: true` flag on `POST /v1/documents`) | shipped, opt-in; per-chunk LLM blurb prepended to `indexed_content`, vLLM auto-caches the document prefix |
+| 🟢 Editable prompt files in `api/prompts/*.md` (decoupled from Python code) | shipped; covers CR + query-time entity extraction, restart api to reload |
+| 🟢 Test gates: every SOTA mechanism has a "did it actually fire?" test | shipped (115 tests passing: 107 fast + 7 slow + 1 environment-conditional skip) |
 | 🟡 LightRAG ingest is ~1-3 min per chunk on local 27B reasoning LLM | by design; bulk-ingest path uses `X-LightRAG-Ingest: false` header |
 | 🟡 Cross-encoder rerank is CPU-bound and slow at multi-second p50 | by design; GPU TEI is a tag swap |
-| 🟡 Anthropic Contextual Retrieval lives in the wrapper, not the engine | by design; ingest-time content transformation is a corpus-owner decision |
+| 🟡 Contextual Retrieval blurbing reuses `LLM_BASE_URL`, so a 27B reasoning LLM blurbs slowly | by design; per-purpose LLM env vars are a deferred refactor (see "Deferred decisions") |
 | 🔴 No authentication; intended behind a reverse proxy | known |
 | 🔴 Single node; no clustering/replication | known |
 | 🔴 TEI cpu-1.9; no GPU image baked in | tag swap to `cuda` / `rocm` variants when needed |
@@ -320,15 +322,43 @@ OpenAPI docs auto-generated at <http://localhost:5050/docs>. Full request/respon
 
 ### Contextual Chunk Headers (built-in)
 
-rag-base auto-prepends three structural prefixes to each chunk before embedding and BM25:
+rag-base auto-prepends structural prefixes to each chunk before embedding and BM25:
 
 1. Document title and metadata: `[<title> | <k1>: <v1> | <k2>: <v2>]`
 2. Markdown heading breadcrumb at chunk start: `[Section > Subsection > Heading]` (omitted for headerless chunks)
-3. The raw chunk text
+3. **Optional**: Anthropic Contextual Retrieval blurb (a 50-100 token LLM-generated context line) when `contextual_retrieval: true` is sent on `POST /v1/documents`
+4. The raw chunk text
 
-The augmented form lives in `chunks.indexed_content` and is what the embedder sees and what BM25 indexes. Raw chunk text in `chunks.content` stays clean for display. **No configuration needed.**
+The augmented form lives in `chunks.indexed_content` and is what the embedder sees and what BM25 indexes. Raw chunk text in `chunks.content` stays clean for display.
 
-For another ~28-49% retrieval lift on top of that, implement [Anthropic's Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval) **in your client** before ingesting (LLM-generated 50-100 token blurb per chunk, prepended to chunk text). That's an ingest-time content transformation: out of scope for the engine, in scope for the wrapper.
+**Steps 1-2 are always on, no configuration.** Step 3 is opt-in per ingest:
+
+```bash
+curl -X POST http://localhost:5050/v1/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "...", "content": "...", "metadata": {...}, "contextual_retrieval": true}'
+```
+
+When enabled, the api makes one LLM call per chunk (the configured `LLM_BASE_URL`) with the full document as a stable prefix. vLLM's automatic prefix caching shares the document KV across the per-chunk calls, dropping the cost to ~$1 per 1M document tokens (Anthropic's measured number with their cookbook + prompt cache). On per-chunk LLM failure the chunk gets no blurb but ingest still succeeds. The prompt body is `api/prompts/contextual_retrieval.md`, editable without code changes; restart the api container to reload after editing.
+
+Anthropic reports **35% / 49% / 67%** reduction in retrieval failures (alone, with BM25, with rerank). Lift is corpus-dependent; on saturated smoke sets the gain is invisible. Measure on your real corpus before deciding whether to enable corpus-wide.
+
+#### CR verification on this engine (2026-04-27)
+
+Ingested an 1784-word doc (`llm.txt` head, 4 chunks) through `POST /v1/documents` with `contextual_retrieval: true` against the local Qwen3.6-27B-AWQ4 vLLM. All 4 blurbs landed clean and specific (e.g. *"Technical Reference: System Purpose, Ingest Pipeline (Chunking, Contextual Chunk Headers, Embedding, Postgres Storage, LightRAG Entity Extraction), and Hybrid Retrieval Pipeline …"* ), no generic sludge, no per-chunk failures. Wall: 580 s for 4 chunks (serial; cache-warm pattern: first call solo to populate the prefix cache, the rest sequential).
+
+Retrieval matrix against the same doc, 4 queries each crafted to target a specific chunk:
+
+| Query (paraphrased) | target chunk | lexical | semantic | hybrid |
+|---|---|:---:|:---:|:---:|
+| graph fast mode endpoint with NER | 1 | **1** | **1** | **1** |
+| reranker container memgraph ports | 2 | **1** | **1** | **1** |
+| startup order health checks | 3 | **1** | **1** | **1** |
+| system purpose ingest pipeline | 0 | 2 | **1** | **1** |
+
+**11/12 = 91.7% hit@1** across the matrix. The single rank-2 (lexical) put the CR-augmented chunk at rank 2 behind a leftover non-CR chunk with overlapping content; semantic and hybrid both pulled it back to rank 1, with the CR-augmented chunk outranking the non-CR equivalent in the same retrieval space. That's CR doing its job: the blurb adds disambiguating context the embedder uses to break ties.
+
+`chunks.content` integrity verified: all 4 chunks hold unmodified slices of the source doc; `indexed_content` carries the CCH + blurb. The reranker (which sees `chunks.content`, not `indexed_content`) is unaffected by CR.
 
 ---
 
@@ -385,11 +415,15 @@ TEI cannot load any SOTA candidate (loader is restricted to encoder-only familie
 </details>
 
 <details>
-<summary><b>Anthropic Contextual Retrieval: out of scope (lives in the wrapper)</b></summary>
+<summary><b>Anthropic Contextual Retrieval: shipped as opt-in flag (was deferred to wrapper, now in engine)</b></summary>
 
-CR is an ingest-time content transformation, not an engine algorithm: cheap LLM generates a 50-100 token chunk-specific blurb, prepended to each chunk before embedding and BM25 indexing. Anthropic reports **35% / 49% / 67%** reduction in retrieval failures (alone, with BM25, with rerank).
+CR is an ingest-time content transformation: a cheap LLM generates a 50-100 token chunk-specific blurb, prepended to each chunk before embedding and BM25 indexing. Anthropic reports **35% / 49% / 67%** reduction in retrieval failures (alone, with BM25, with rerank).
 
-This is a decision about *what you ingest*, not *what the engine does*. rag-base is the agnostic engine; CCH (title + metadata + header path) is built in. CR is the next layer up and lives in the consumer (e.g. knowledge-base wrapper).
+The deferral originally placed CR in the consumer (knowledge-base wrapper). Reconsidered: the engine already has an LLM dependency for LightRAG ingest and query-time entity extraction; adding CR as a third user of the same dependency is cheap, and putting it inline avoids the chunk-boundary coordination problem the wrapper-side approach would have. **Shipped 2026-04-27 as an opt-in flag**: `POST /v1/documents` with `{"contextual_retrieval": true}` runs CR; default false preserves byte-identical behavior for callers who don't opt in. vLLM's automatic prefix caching shares the document KV across the per-chunk calls, so cost stays at ~$1 per 1M document tokens.
+
+The prompt body lives in `api/prompts/contextual_retrieval.md` and is editable without touching Python. Bring up the api with `LLM_BASE_URL` reachable; per-chunk LLM failure degrades gracefully (that chunk gets no blurb, ingest still succeeds).
+
+**Deferred follow-on (still open)**: per-purpose LLM env vars (`LLM_INGEST_*` / `LLM_QUERY_*` / `LLM_BLURBER_*`) so callers can route CR blurbing to a small fast model while keeping the big model for entity extraction. Today CR shares `LLM_BASE_URL` with the rest, so blurbing on a 27B reasoning model is slower than necessary. ~50 LOC additive change with no breakage when revisited.
 </details>
 
 ### Do the deferred-quality losses compound?
@@ -525,9 +559,12 @@ rag-base/
 ├── api/                    # FastAPI app (only custom code)
 │   ├── Dockerfile
 │   ├── requirements.txt
+│   ├── prompts/            # User-editable LLM prompt templates (.md, with {{var}} substitution)
+│   │   ├── contextual_retrieval.md
+│   │   └── query_entity_extraction.md
 │   └── src/
 │       ├── routers/        # FastAPI routes (search, graph_search, documents, ...)
-│       ├── services/       # chunking, embedding, fusion, lightrag_store, ner, ...
+│       ├── services/       # chunking, embedding, fusion, lightrag_store, ner, prompts, ...
 │       └── models/         # Pydantic request/response models
 ├── tests/                  # Unit + integration tests, golden set, integration_validation runner
 ├── scripts/                # Backup/restore

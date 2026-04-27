@@ -157,9 +157,17 @@ Ingest a document. Chunks it, embeds each chunk's `indexed_content`, stores ever
 {
   "title": "React Documentation",
   "content": "React is a JavaScript library for building user interfaces...",
-  "metadata": {"source": "docs", "language": "en"}
+  "metadata": {"source": "docs", "language": "en"},
+  "contextual_retrieval": false
 }
 ```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `title` | string | *(required)* | Document title; min length 1 |
+| `content` | string | *(required)* | Document body; min length 1 |
+| `metadata` | object | `{}` | Free-form JSONB metadata (becomes searchable via document filters) |
+| `contextual_retrieval` | bool | `false` | When true, runs Anthropic Contextual Retrieval per chunk: the LLM at `LLM_BASE_URL` generates a 50-100 token "situating" blurb per chunk, prepended to `chunks.indexed_content` (raw `chunks.content` stays untouched). Requires the LLM endpoint to be reachable; on per-chunk LLM failure that chunk gets no blurb but ingest still succeeds. Prompt body lives in `api/prompts/contextual_retrieval.md` (user-editable). |
 
 **Response (201):**
 ```json
@@ -519,10 +527,32 @@ Persistence is bind-mounted to `./data/{postgres,memgraph,lightrag}`; no env var
 
 ---
 
+## Prompt templates (`api/prompts/`)
+
+LLM prompt bodies are decoupled from Python code and live in `api/prompts/*.md`. Two prompts ship today:
+
+| File | Used by | Variables |
+|---|---|---|
+| `api/prompts/contextual_retrieval.md` | `services/contextual_retrieval.py` when `POST /v1/documents` runs with `contextual_retrieval: true` | `{{document}}`, `{{chunk}}` |
+| `api/prompts/query_entity_extraction.md` | `services/lightrag_store.py:extract_query_entities` (graph channel of `POST /v1/search`) | `{{query}}` |
+
+Each file may begin with an HTML comment block (`<!-- ... -->`) used as inline editor docs; the loader strips that header before the template reaches the LLM. Substitution is a single regex pass: `{{name}}` placeholders are replaced once, substituted values are NOT re-scanned (so a document that contains literal `{{chunk}}` is harmless).
+
+Templates are loaded once at first access and cached for the process lifetime. To pick up an edit:
+
+```
+docker compose restart api
+```
+
+Adding a new prompt: drop a new `.md` under `api/prompts/`, render with `prompts.render("name", **vars)` from `src.services.prompts`. No Python registration needed; missing template names raise `FileNotFoundError` at first use.
+
+---
+
 ## Verified behavior
 
 - Ingest is atomic: document + chunks + vectors in one Postgres transaction. If embedding fails, nothing is committed.
 - LightRAG ingest is best-effort: if it fails or hangs past its internal timeout, the doc is still committed; only graph extraction is skipped.
+- Contextual Retrieval is opt-in via `contextual_retrieval: true` on `POST /v1/documents`; when enabled, per-chunk LLM failure produces an empty blurb for that chunk only and ingest still succeeds. With the flag false (default) ingest is byte-identical to pre-CR behavior.
 - Chunk inserts use batch `executemany`.
 - Hybrid search runs semantic + keyword (+ graph if enabled) in parallel, merges with RRF.
 - RRF correctly boosts results found by multiple retrievers (dual-match scores ~2x single-match).
@@ -554,7 +584,9 @@ Persistence is bind-mounted to `./data/{postgres,memgraph,lightrag}`; no env var
 
 **Contextual Chunk Headers (built-in)**: rag-base automatically prepends the document title, metadata, and the markdown heading breadcrumb to each chunk's `indexed_content` before embedding and BM25 indexing. This is what the embedder and BM25 actually see; the raw chunk text in `chunks.content` is preserved for display. No configuration needed.
 
-**Contextual Retrieval (client-side)**: For further improvement, implement Anthropic's Contextual Retrieval before ingesting. Use an LLM to generate a 50-100 token chunk-specific summary, prepend it to the chunk content, then send to `POST /v1/documents`. Up to 49% fewer retrieval failures. Requires LLM calls at ingest time, so this is a client concern, not built into rag-base.
+**Contextual Retrieval (built-in, opt-in)**: Send `contextual_retrieval: true` on `POST /v1/documents` to enable Anthropic Contextual Retrieval at ingest. The api makes one LLM call per chunk against `LLM_BASE_URL`, with the full document as a stable prefix so vLLM's automatic prefix caching shares the doc KV across calls (~$1 per 1M document tokens, per Anthropic's measured cost). The 50-100 token blurb gets prepended to `chunks.indexed_content` alongside the title + header path; raw `chunks.content` stays unchanged. Anthropic reports up to 49% fewer retrieval failures with CR alone, 67% with rerank. Lift is corpus-dependent; measure before enabling corpus-wide.
+
+The CR prompt body lives in `api/prompts/contextual_retrieval.md`; edit and `docker compose restart api` to reload (no code change required).
 
 **Use the right endpoint for the query**:
 - `/v1/search` for general queries where you want recall + precision.
