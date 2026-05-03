@@ -7,11 +7,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Status-Shipped_2026--04--27-brightgreen" alt="Status" />
-  <img src="https://img.shields.io/badge/Tests-97%2F97_passing-brightgreen" alt="Tests" />
   <img src="https://img.shields.io/badge/hit@5-1.00_across_all_hybrid_channels-success" alt="hit@5" />
   <img src="https://img.shields.io/badge/Endpoints-4_search_modes-blue" alt="Endpoints" />
   <img src="https://img.shields.io/badge/Persistence-bind--mounts_(prune--proof)-0b7285" alt="Persistence" />
-  <img src="https://img.shields.io/badge/TODOs-zero_in_shipped_code-brightgreen" alt="TODO" />
 </p>
 
 <p align="center">
@@ -38,8 +36,8 @@
 
 | Channel | hit@1 | hit@5 | MRR | p50 latency | Notes |
 |---|---:|---:|---:|---:|---|
-| 🟢 `lexical` (BM25) | **0.92** | **1.00** | **0.962** | **3 ms** | one paraphrase miss at rank 2 |
-| 🟢 `semantic` (pgvector cosine) | 0.92 | 1.00 | 0.942 | 85 ms | one multi-hop miss at rank 4 |
+| 🟢 `lexical` (BM25) | **0.92** | **1.00** | **0.949** | **3 ms** | one paraphrase miss at rank 3 |
+| 🟧 `semantic` (pgvector cosine) | 0.85 | 0.92 | 0.897 | 45 ms | two multi-hop misses (rank 2 and rank 6); only non-fused channel that does not saturate hit@5 |
 | 🟢 `hybrid_norerank` (RRF) | **0.92** | **1.00** | **0.962** | 80 ms | RRF promotes paraphrase miss back to 1 |
 | 🟧 `hybrid_rerank` (RRF + cross-encoder) | 0.85 | 1.00 | 0.904 | **~28 s** | reranker reorders multi-hop down; latency dominated by CPU inference |
 | 🟢 `hybrid_graph_norerank` (RRF + graph) | **0.92** | **1.00** | **0.962** | 880 ms | graph adds candidates without disrupting other channels |
@@ -497,7 +495,7 @@ All via `.env`. Full annotated template at [`.env.template`](.env.template).
 ## 🧪 Tests
 
 ```bash
-# Full suite (97 tests, ~4:18 wall on the dev box)
+# Full suite (115 tests: 107 fast + 7 slow + 1 environment-conditional skip)
 pytest
 
 # Fast iteration (deselect slow LightRAG ingest tests)

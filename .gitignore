@@ -36,3 +36,6 @@ htmlcov/
 
 # Integration validation runner ephemeral state (regenerated per session)
 tests/integration_validation/results/
+
+# Local-only: one-time ship report, redundant with README + git history
+SHIP.md
