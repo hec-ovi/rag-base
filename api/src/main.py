@@ -61,6 +61,55 @@ async def lifespan(app: FastAPI):
             await client.aclose()
             logger.warning("Reranker unreachable at %s, disabled", settings.reranker_url)
 
+    # 3b. Optional GPU reranker sidecars (purely additive; default request path
+    # still uses app.state.rerank_client). Each one is probed independently and
+    # degrades to None on failure; the search router silently falls back to the
+    # default reranker when a requested sidecar is unavailable.
+    app.state.bge_gpu_rerank_client = None
+    if settings.bge_gpu_reranker_url:
+        c = httpx.AsyncClient(base_url=settings.bge_gpu_reranker_url, timeout=60.0)
+        try:
+            resp = await c.get("/health")
+            if resp.status_code == 200:
+                app.state.bge_gpu_rerank_client = c
+                logger.info("BGE-GPU reranker connected: %s", settings.bge_gpu_reranker_url)
+            else:
+                await c.aclose()
+                logger.warning("BGE-GPU reranker unhealthy (status %d), disabled", resp.status_code)
+        except Exception:
+            await c.aclose()
+            logger.warning("BGE-GPU reranker unreachable at %s, disabled", settings.bge_gpu_reranker_url)
+
+    app.state.qwen_rerank_client = None
+    if settings.qwen_reranker_url:
+        c = httpx.AsyncClient(base_url=settings.qwen_reranker_url, timeout=120.0)
+        try:
+            resp = await c.get("/health")
+            if resp.status_code == 200:
+                app.state.qwen_rerank_client = c
+                logger.info("Qwen reranker connected: %s", settings.qwen_reranker_url)
+            else:
+                await c.aclose()
+                logger.warning("Qwen reranker unhealthy (status %d), disabled", resp.status_code)
+        except Exception:
+            await c.aclose()
+            logger.warning("Qwen reranker unreachable at %s, disabled", settings.qwen_reranker_url)
+
+    app.state.qwen_8b_rerank_client = None
+    if settings.qwen_8b_reranker_url:
+        c = httpx.AsyncClient(base_url=settings.qwen_8b_reranker_url, timeout=180.0)
+        try:
+            resp = await c.get("/health")
+            if resp.status_code == 200:
+                app.state.qwen_8b_rerank_client = c
+                logger.info("Qwen-8B reranker connected: %s", settings.qwen_8b_reranker_url)
+            else:
+                await c.aclose()
+                logger.warning("Qwen-8B reranker unhealthy (status %d), disabled", resp.status_code)
+        except Exception:
+            await c.aclose()
+            logger.warning("Qwen-8B reranker unreachable at %s, disabled", settings.qwen_8b_reranker_url)
+
     # 4. Memgraph (optional — degrade gracefully)
     app.state.graph_driver = None
     if settings.memgraph_enabled:
@@ -142,6 +191,12 @@ async def lifespan(app: FastAPI):
     await app.state.embed_client.aclose()
     if app.state.rerank_client:
         await app.state.rerank_client.aclose()
+    if getattr(app.state, "bge_gpu_rerank_client", None):
+        await app.state.bge_gpu_rerank_client.aclose()
+    if getattr(app.state, "qwen_rerank_client", None):
+        await app.state.qwen_rerank_client.aclose()
+    if getattr(app.state, "qwen_8b_rerank_client", None):
+        await app.state.qwen_8b_rerank_client.aclose()
     if app.state.graph_driver:
         await app.state.graph_driver.close()
 

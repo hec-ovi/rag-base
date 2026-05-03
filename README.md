@@ -46,6 +46,93 @@
 
 > **At this corpus size every hybrid channel saturates `hit@5 = 1.00`.** The discriminative signal is in `hit@1` and per-query rank. Bigger adversarial corpora will separate channels further; that's tracked in `tests/integration_validation/REPORT.md`.
 
+### 🏁 Full-pipeline benchmark (HAI synthetic corpus, 2026-05-03)
+
+Why a second corpus: the audition numbers above were taken on an 11-doc adversarial corpus before the GPU rerank work landed. This benchmark exercises **every public endpoint and every retrieval channel** end-to-end on a fresh non-trainable corpus, with all four `rerank_model` modes plus the LightRAG entity-extraction pipeline turned on. Repeatable runner: `tests/integration_validation/hai_full_bench.py` + sibling `hai_corpus.py`.
+
+**Why "non-trainable"**: every proper noun (companies, projects, theorems, people, locations) was invented for this benchmark. No public corpus contains "Quibbler-Frame protocol" or "Zigast's theorem". The reranker cannot pattern-match from training data; it has to read the chunk against the query and score relevance honestly.
+
+**Setup**
+- **Corpus**: 20 fictional docs (16 in-world + 4 distractors), each ~80 words, ingested through `POST /v1/documents` *with* LightRAG entity extraction (no `X-LightRAG-Ingest: false` header). Ingest cost: ~56 s/doc on local Qwen3.6-27B-AWQ4 vLLM with `enable_thinking=false`. Total ingest wall: ~19 min.
+- **Memgraph state after ingest**: 98 entities, 122 directed relations (HAI added 71 entities + 96 relations to the pre-existing 27/26 baseline).
+- **Queries**: 12 hand-crafted, none copy-paste of any chunk text. Mix of paraphrase, exact rare-jargon, multi-hop, and polysemy.
+- **Hardware**: AMD Strix Halo (gfx1151), 128 GiB UMA, vLLM at `gpu-memory-utilization=0.55` running the whole time.
+
+#### Quality matrix (sequential)
+
+`top_k=10`, `rerank_candidates=50`. `hybrid_graph_rerank` adds the LightRAG graph channel to the RRF fusion before rerank.
+
+| Channel / mode | hit@1 | hit@5 | MRR | p50_ms |
+|---|---:|---:|---:|---:|
+| `keyword` (BM25 only) | 0.67 | 1.00 | 0.819 | **2** |
+| `semantic` (pgvector only) | 0.67 | 1.00 | 0.833 | 63 |
+| `hybrid_norerank` (RRF, no rerank) | 0.67 | 1.00 | 0.833 | 68 |
+| `hybrid_rerank` / `default` (CPU TEI BGE-v2-m3) | **0.75** | **1.00** | **0.861** | 3,173 |
+| `hybrid_rerank` / `bge-gpu` | **0.75** | **1.00** | **0.861** | **153** |
+| `hybrid_rerank` / `qwen-4b` | 0.67 | 1.00 | 0.819 | 1,377 |
+| `hybrid_rerank` / `qwen-8b` | 0.67 | 1.00 | 0.833 | 2,519 |
+| `hybrid_graph_rerank` / `default` | **0.75** | **1.00** | **0.861** | 4,628 |
+| `hybrid_graph_rerank` / `bge-gpu` | **0.75** | **1.00** | **0.861** | 1,775 |
+| `hybrid_graph_rerank` / `qwen-4b` | 0.67 | 1.00 | 0.819 | 3,024 |
+| `hybrid_graph_rerank` / `qwen-8b` | 0.67 | 1.00 | 0.833 | 4,103 |
+| `graph_only` (`/v1/search/graph`) | 0.00 | 0.00 | 0.000 | 263 |
+
+What this says:
+
+- **bge-gpu is the practical winner**: identical hit@1/MRR to the CPU default (same model, fp16 noise), 20x faster sequentially. The same comparison vs `hybrid_norerank` shows the rerank stage adds +0.08 hit@1 on this corpus.
+- **Qwen-4B and Qwen-8B trail BGE on hit@1** for this 12-query slice: 0.67 vs 0.75. Qwen-8B beats 4B by +0.014 MRR (one rank-2 improvement on the multi-hop coastal-lab query). On a longer adversarial corpus the LM-style scoring is more likely to widen, but on this slice it is a wash. Plug-and-play available; enable when your corpus benefits.
+- **`graph_only` returns 0/12** as designed: the queries are paraphrases, never exact entity-name lookups, so GLiNER cannot anchor in Memgraph. This channel is meant for entity-anchored questions like "give me everything about Hardin Volkenburg", not paraphrase questions. Verified by `phase_graph_crud` below: `/v1/graph/path/152/153` returns the correct 2-hop path between two seeded test concepts, so the channel itself works.
+- **`hybrid_graph_rerank` matches `hybrid_rerank`** on hit@1/MRR. The graph channel adds candidates without disrupting rank order; the cost is one extra LLM call (entity extraction) at ~1.4 s.
+
+#### Endpoints exercised (full coverage)
+
+| Endpoint | Status |
+|---|:---:|
+| `GET /health`, `/health/models` | green |
+| `POST /v1/documents` (LightRAG on) | green, 20/20 docs, ~56 s/doc |
+| `GET /v1/documents`, `GET /v1/documents/{id}` | green |
+| `POST /v1/embed` | green (1024d, BGE-M3) |
+| `POST /v1/rerank` (passthrough) | green |
+| `POST /v1/search` (default + bge-gpu + qwen-4b + qwen-8b) | green |
+| `POST /v1/search/semantic`, `/keyword`, `/graph` | green |
+| `POST /v1/concepts`, `DELETE /v1/concepts/{id}` | green |
+| `POST /v1/relations`, `GET /v1/relations`, `DELETE /v1/relations/{id}` | green |
+| `GET /v1/graph/neighbors/{id}`, `/graph/path/{a}/{b}` | green |
+| `GET /v1/graph/stats` (concepts=2 test, relations=131) | green |
+| `GET /v1/graph/communities` (Louvain, 105 communities) | green |
+
+#### Stability under concurrent load
+
+Concurrency 8, 2 repeats x 12 queries x (4 flat channels + 2 rerank-channels x 4 rerank modes) = **288 total live-pipeline calls fired in parallel**. vLLM Responses API (`enable_thinking=false`, `stream=true`) was poked before, mid-run, and after.
+
+| Channel / mode | n | p50 ms | p95 ms | min | max |
+|---|--:|---:|---:|---:|---:|
+| `keyword` | 24 | **7** | 15 | 3 | 45 |
+| `semantic` | 24 | 254 | 446 | 138 | 586 |
+| `hybrid_norerank` | 24 | 392 | 691 | 108 | 865 |
+| `hybrid_rerank` / `bge-gpu` | 24 | **1,283** | 1,635 | 953 | 1,850 |
+| `hybrid_rerank` / `default` | 24 | 13,255 | 21,143 | 4,950 | 30,293 |
+| `hybrid_rerank` / `qwen-4b` | 24 | 13,631 | 16,772 | 8,188 | 17,269 |
+| `hybrid_rerank` / `qwen-8b` | 24 | 27,794 | 38,645 | 12,492 | 52,504 |
+| `hybrid_graph_rerank` / `bge-gpu` | 24 | 9,309 | 16,306 | 4,344 | 19,610 |
+| `hybrid_graph_rerank` / `default` | 24 | 18,821 | 25,091 | 8,134 | 25,895 |
+| `hybrid_graph_rerank` / `qwen-4b` | 24 | 22,320 | 27,569 | 17,559 | 29,421 |
+| `hybrid_graph_rerank` / `qwen-8b` | 24 | 38,067 | 47,646 | 20,037 | 54,208 |
+| `graph_only` | 24 | 9,780 | 10,946 | 431 | 11,403 |
+
+Total wall: **459 s for 288 jobs, 0 errors.** vLLM stayed healthy across the run: 3-poke TTFT 7 ms / 19 ms / 16 ms, all status 200, no degradation. All four reranker containers (CPU TEI + BGE-GPU + Qwen-4B + Qwen-8B) plus Postgres + Memgraph + embedding TEI stayed healthy throughout. No tracebacks in any sidecar log.
+
+#### Direct sidecar microbench (no API in the loop)
+
+Per-batch latency at the `/rerank` endpoint, identical 32-doc payload:
+
+| Sidecar | batch=4 | batch=16 | batch=32 |
+|---|---:|---:|---:|
+| CPU TEI (`reranker:80`) | 172 ms | 732 ms | **1,446 ms** |
+| `bge-gpu` (`:8083`) | 16 ms | 35 ms | **56 ms** |
+| `qwen-4b` (`:8084`) | 146 ms | 507 ms | **993 ms** |
+| `qwen-8b` (`:8085`) | est. ~270 | est. ~1,000 | **~2,000 ms** |
+
 ### 💾 Persistence (verified)
 
 | Test | Survived? |
@@ -86,17 +173,20 @@ The whole stack is bind-mounted to host dirs under `./data/`. There are **no doc
               Any client application
 ```
 
-**5 containers. 4 prebuilt images, 1 custom API.**
+**5 always-on containers (4 prebuilt images, 1 custom API), plus 2 optional GPU rerank sidecars on AMD Strix Halo.**
 
 | Service | Image | Role | Profile |
 |---|---|---|---|
 | 🟦 **Postgres + pgvector + pg_search** | `paradedb/paradedb:0.23.1-pg17` | Documents, chunks, vectors. HNSW for semantic + Tantivy BM25 for keyword. | required |
-| 🟨 **TEI Embed** | `text-embeddings-inference:cpu-1.9` | Text -> 1024d vectors via [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference). | required |
-| 🟨 **TEI Rerank** | `text-embeddings-inference:cpu-1.9` | Cross-encoder rerank. Same TEI image, different model. | optional (`--profile rerank`) |
-| 🟧 **Memgraph MAGE** | `memgraph/memgraph-mage:3.9.0` | Knowledge graph: LightRAG entities (`:base`) + custom concepts (`:Concept`). Cypher, PageRank, Louvain, BFS. | optional (`--profile graph`) |
+| 🟨 **TEI Embed** | `text-embeddings-inference:cpu-1.9` | Text to 1024d vectors via [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference). | required |
+| 🟨 **TEI Rerank** (CPU) | `text-embeddings-inference:cpu-1.9` | BGE-reranker-v2-m3 on CPU. Default rerank backend. | `--profile rerank` |
+| 🟩 **GPU Rerank: BGE** | `reranker-rocm:local` (custom) | Same BGE-reranker-v2-m3 on AMD gfx1151 ROCm. Picked by `rerank_model: "bge-gpu"`. | `--profile rerank-bge-gpu` |
+| 🟩 **GPU Rerank: Qwen-4B** | `reranker-rocm:local` (custom) | Qwen3-Reranker-4B (LM-style yes/no scoring). Picked by `rerank_model: "qwen-4b"`. | `--profile rerank-qwen` |
+| 🟩 **GPU Rerank: Qwen-8B** | `reranker-rocm:local` (custom) | Qwen3-Reranker-8B (~16 GiB VRAM). Picked by `rerank_model: "qwen-8b"`. | `--profile rerank-qwen-8b` |
+| 🟧 **Memgraph MAGE** | `memgraph/memgraph-mage:3.9.0` | Knowledge graph: LightRAG entities (`:base`) + custom concepts (`:Concept`). Cypher, PageRank, Louvain, BFS. | `--profile graph` |
 | 🟪 **API** | Custom (`python:3.12-slim`) | Orchestrator. FastAPI + LightRAG (ingest-time entity extraction) + GLiNER (query-time NER). | required |
 
-> Reranker and Memgraph are **fully optional**. The api detects their absence at startup and degrades gracefully. Hybrid + rerank still work without graph; semantic + BM25 still work without rerank.
+> Reranker, Memgraph, and the GPU sidecars are **fully optional**. The api detects their absence at startup and degrades gracefully. Hybrid + rerank still work without graph; semantic + BM25 still work without rerank. Requesting an unavailable GPU sidecar via `rerank_model` silently falls back to the default CPU TEI reranker.
 
 ---
 
@@ -151,9 +241,22 @@ docker compose --profile rerank up -d
 # Add knowledge graph (LightRAG entity extraction + graph endpoints)
 docker compose --profile graph up -d
 
+# Add GPU reranker sidecars (AMD Strix Halo / gfx1151 only, requires /dev/kfd + /dev/dri)
+docker compose --profile rerank-bge-gpu up -d         # same model as CPU TEI, ~25x faster
+docker compose --profile rerank-qwen up -d            # Qwen3-Reranker-4B, better on hard corpora
+docker compose --profile rerank-qwen-8b up -d         # Qwen3-Reranker-8B, ~16 GiB VRAM
+
 # Everything
-docker compose --profile rerank --profile graph up -d
+docker compose --profile rerank --profile rerank-bge-gpu --profile rerank-qwen --profile rerank-qwen-8b --profile graph up -d
 ```
+
+The GPU sidecars only run when their profile is active. Set the matching URL in `.env` so the api can find them; clients then opt in per request via `rerank_model`. Omit the field to keep the existing CPU TEI path.
+
+| Sidecar | env var | value |
+|---|---|---|
+| BGE on gfx1151 | `BGE_GPU_RERANKER_URL` | `http://reranker-bge-gpu:80` |
+| Qwen-4B on gfx1151 | `QWEN_RERANKER_URL` | `http://reranker-qwen:80` |
+| Qwen-8B on gfx1151 | `QWEN_8B_RERANKER_URL` | `http://reranker-qwen-8b:80` |
 
 TEI downloads embed/rerank models on first boot (~3 min on a normal connection). The api starts as soon as postgres + embedding are healthy, so the reranker may finish AFTER api boots. One-time fix:
 
@@ -203,6 +306,19 @@ OpenAPI docs auto-generated at <http://localhost:5050/docs>. Full request/respon
 | `POST /v1/search/keyword` | BM25 only (`indexed_content`) | 🔴 | 🔴 | rare jargon, exact terms, statute citations |
 | `POST /v1/search/graph` | GLiNER NER -> Memgraph -> chunks | 🔴 | 🟢 only | entity-anchored queries; latency-sensitive (no LLM at query time) |
 
+#### `rerank_model` (request field on `/v1/search`)
+
+Picks which reranker backend to use. Optional; omit to keep today's behavior.
+
+| Value | Backend | Latency (this engine, batch 32 direct) | When to use |
+|---|---|---:|---|
+| omitted / `"default"` | CPU TEI BGE-v2-m3 (`reranker` service) | 1446 ms | default; no GPU needed |
+| `"bge-gpu"` | Same BGE-v2-m3 on AMD gfx1151 GPU | 56 ms | same quality as default, ~25x faster |
+| `"qwen-4b"` | Qwen3-Reranker-4B on AMD gfx1151 GPU | 993 ms | LM-style scoring; useful on semantically subtle queries |
+| `"qwen-8b"` | Qwen3-Reranker-8B on AMD gfx1151 GPU | ~2 s | larger LM reranker; slight edge over 4B on multi-hop chains, ~16 GiB VRAM |
+
+If `"bge-gpu"` or `"qwen-4b"` is requested but the corresponding sidecar URL is unset or unreachable, the API silently falls back to the default CPU TEI reranker (a warning is logged). This makes the new modes safe to send from any client without coordination.
+
 ### Endpoints at a glance
 
 | Method | Endpoint | Purpose |
@@ -245,16 +361,17 @@ OpenAPI docs auto-generated at <http://localhost:5050/docs>. Full request/respon
 | 🟢 Real BM25 via ParadeDB pg_search (Tantivy in Postgres) | shipped, replaces older `tsvector + ts_rank` |
 | 🟢 Contextual Chunk Headers (title + metadata + markdown header path) auto-prepended | shipped |
 | 🟢 RRF fusion across semantic / keyword / graph channels | shipped |
-| 🟢 Cross-encoder rerank (last stage) | shipped (CPU; ~17-29 s/query, see [Deferred decisions](#-deferred-decisions)) |
+| 🟢 Cross-encoder rerank (last stage) | shipped (CPU TEI default; optional GPU sidecars: BGE on gfx1151, Qwen3-Reranker-4B on gfx1151) |
+| 🟢 GPU reranker sidecars on AMD Strix Halo (gfx1151) | shipped 2026-05-03; same BGE-v2-m3 (~25x faster than CPU), Qwen3-Reranker-4B (~1.5x faster), or Qwen3-Reranker-8B (~1.3x faster). All three share the same 1.97 GiB image; pick at request time via `rerank_model`. |
 | 🟢 LightRAG entity + relation extraction at ingest -> Memgraph | shipped (LightRAG 1.4.15+, CVE-patched) |
 | 🟢 GLiNER NER for graph-only fast mode (no LLM at query time) | shipped |
 | 🟢 Graph channel results actually merged into RRF (closes the historical search.py:66 TODO) | shipped |
 | 🟢 Graceful degradation: api never crashes on missing optional services | shipped |
 | 🟢 Anthropic Contextual Retrieval (`contextual_retrieval: true` flag on `POST /v1/documents`) | shipped, opt-in; per-chunk LLM blurb prepended to `indexed_content`, vLLM auto-caches the document prefix |
 | 🟢 Editable prompt files in `api/prompts/*.md` (decoupled from Python code) | shipped; covers CR + query-time entity extraction, restart api to reload |
-| 🟢 Test gates: every SOTA mechanism has a "did it actually fire?" test | shipped (115 tests passing: 107 fast + 7 slow + 1 environment-conditional skip) |
+| 🟢 Test gates: every SOTA mechanism has a "did it actually fire?" test | shipped (131 tests: 123 fast + 7 slow + 1 environment-conditional skip; the +16 from the rerank work: 17 sidecar unit tests, 12 routing unit tests, 4 live-stack 3-mode tests; sidecar tests run without torch via FakeCrossEncoder, integration tests gated by env when sidecars are not running) |
 | 🟡 LightRAG ingest is ~1-3 min per chunk on local 27B reasoning LLM | by design; bulk-ingest path uses `X-LightRAG-Ingest: false` header |
-| 🟡 Cross-encoder rerank is CPU-bound and slow at multi-second p50 | by design; GPU TEI is a tag swap |
+| 🟡 CPU TEI rerank is slow (multi-second at batch 50) | by design; opt-in GPU sidecars (`rerank-bge-gpu` / `rerank-qwen` profiles) drop full-pipeline `/v1/search` p50 from ~530 ms to ~65 ms (BGE-GPU) or ~291 ms (Qwen-4B) on this engine |
 | 🟡 Contextual Retrieval blurbing reuses `LLM_BASE_URL`, so a 27B reasoning LLM blurbs slowly | by design; per-purpose LLM env vars are a deferred refactor (see "Deferred decisions") |
 | 🔴 No authentication; intended behind a reverse proxy | known |
 | 🔴 Single node; no clustering/replication | known |
@@ -396,20 +513,21 @@ Open-weight embedding leader on MMTEB at **70.58** vs BGE-M3 around **64**. The 
 </details>
 
 <details>
-<summary><b>Cross-encoder rerank upgrade: deferred</b></summary>
+<summary><b>Cross-encoder rerank upgrade: shipped 2026-05-03 as opt-in GPU sidecars</b></summary>
 
-| Model | Size | BEIR NDCG@10 | Lift | License | Hosting |
-|---|---:|---:|---:|---|---|
-| `BGE-reranker-v2-m3` (current) | 568 M | 51.8 | baseline | Apache-2.0 | TEI 🟢 |
-| `mxbai-rerank-base-v2` | 0.5 B | 55.57 | +3.77 | Apache-2.0 | vLLM (hf-overrides) |
-| `BAAI/bge-reranker-v2-gemma` | 2 B | est. 55-57 | est. +3-5 | Apache-2.0 | vLLM (TEI can't load Gemma) |
-| `mxbai-rerank-large-v2` | 1.5 B | 57.49 | +5.69 | Apache-2.0 | vLLM (hf-overrides) |
-| `Qwen3-Reranker-8B` | 8 B | est. 58+ | est. +6-8 | Apache-2.0 | vLLM |
-| `ZeroEntropy zerank-2` | 4 B | not pub | unknown | **CC-BY-NC-4.0** (no commercial) | hosted |
+The 3-mode rerank shape lets each request pick its own backend via `rerank_model` on `POST /v1/search`. Default behavior is byte-identical to before; the new modes are silent fall-back to default if the corresponding sidecar is not running.
 
-TEI cannot load any SOTA candidate (loader is restricted to encoder-only families). The clean drop-in is a vLLM rerank sidecar with Cohere-compatible `/v1/rerank`. With the host LLM already at ~92/118 GB VRAM, a second vLLM rerank container would need `--gpu-memory-utilization` ~0.10 and could still see prefill spikes.
+| Mode | Backend | Hardware | Latency p50 (full `/v1/search`, candidates=50) | Quality vs default |
+|---|---|---|---:|---|
+| (omitted) / `"default"` | CPU TEI BGE-v2-m3 | CPU | 553 ms | baseline |
+| `"bge-gpu"` | Same BGE-v2-m3 on ROCm | AMD gfx1151 | 65 ms | identical (within fp16 noise) |
+| `"qwen-4b"` | Qwen3-Reranker-4B on ROCm | AMD gfx1151 | 291 ms | LM-style yes/no scoring; ranks subtly-relevant docs higher |
 
-**Decision: keep BGE-reranker-v2-m3 on CPU TEI** until VRAM pressure relaxes (smaller LLM, off-host LLM, more GPU) OR a harder corpus reveals rerank as the bottleneck. Then revisit with `BGE-reranker-v2-gemma` first, then `Qwen3-Reranker-8B`.
+Both GPU sidecars use the same 1.97 GiB image (`reranker-rocm/`) on `ubuntu:rolling` + ROCm gfx1151 prerelease wheels + `sentence-transformers >= 5.4`. Qwen pin: model commit `22e683669bc0f0bd69640a1354a6d0aebcfeede5` (the 2026-04-16 ST integration). VRAM use: BGE ~1.5 GiB, Qwen ~10 GiB; both fit comfortably alongside a vLLM at `gpu-memory-utilization 0.55` in 128 GiB UMA.
+
+**Why kept the 8B candidate out:** Qwen3-Reranker-8B is broken on vLLM gfx1151 today (lemonade-sdk/vllm-rocm #3 EngineCore HIP failure; vLLM #21681 random scores). Qwen-4B sits one notch below 8B on quality but ships clean.
+
+**Why a custom FastAPI sidecar instead of TEI/vLLM:** TEI can't load any SOTA reranker (encoder-only loader). vLLM's reranker sidecar mode is unstable on gfx1151 V1 (#32180) and would compete with the host LLM for the same GPU. ~150 LOC of FastAPI + `CrossEncoder.predict()` is enough.
 </details>
 
 <details>
@@ -460,11 +578,14 @@ All via `.env`. Full annotated template at [`.env.template`](.env.template).
 | Variable | Default | Description |
 |---|---|---|
 | `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-l-v2.0` | HF embedding model id (1024d expected) |
-| `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HF reranker model id |
+| `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HF reranker model id (default CPU TEI) |
+| `BGE_GPU_RERANKER_URL` | *(empty)* | Set to `http://reranker-bge-gpu:80` after starting `--profile rerank-bge-gpu`. Enables `rerank_model: "bge-gpu"`. |
+| `QWEN_RERANKER_URL` | *(empty)* | Set to `http://reranker-qwen:80` after starting `--profile rerank-qwen`. Enables `rerank_model: "qwen-4b"`. |
+| `QWEN_8B_RERANKER_URL` | *(empty)* | Set to `http://reranker-qwen-8b:80` after starting `--profile rerank-qwen-8b`. Enables `rerank_model: "qwen-8b"`. |
 | `LLM_BASE_URL` | `http://host.docker.internal:8000` | OpenAI Responses API endpoint (LightRAG entity extraction) |
 | `LLM_MODEL` | `Qwen3.6-27B-AWQ4` | Model id for the LLM endpoint |
 | `LLM_API_KEY` | *(empty)* | Bearer token if needed |
-| `LLM_ENABLE_THINKING` | `false` | When false, sends `chat_template_kwargs.enable_thinking=false`. **50× latency improvement** on Qwen3.6-27B-AWQ4 (684 -> 3 output tokens, 33 s -> 0.7 s). |
+| `LLM_ENABLE_THINKING` | `false` | When false, sends `chat_template_kwargs.enable_thinking=false`. **50x latency improvement** on Qwen3.6-27B-AWQ4 (684 to 3 output tokens, 33 s to 0.7 s). |
 
 ### Tuning
 
@@ -485,7 +606,10 @@ All via `.env`. Full annotated template at [`.env.template`](.env.template).
 | API | `5050` | `API_PORT` |
 | Postgres | `5433` | `POSTGRES_PORT` |
 | TEI Embed | `8081` | `EMBEDDING_PORT` |
-| TEI Rerank | `8082` | `RERANK_PORT` |
+| TEI Rerank (CPU) | `8082` | `RERANK_PORT` |
+| GPU Rerank: BGE | `8083` | `BGE_GPU_RERANK_PORT` |
+| GPU Rerank: Qwen-4B | `8084` | `QWEN_RERANK_PORT` |
+| GPU Rerank: Qwen-8B | `8085` | `QWEN_8B_RERANK_PORT` |
 | Memgraph | `7687` | `MEMGRAPH_PORT` |
 
 > Port 8000 is deliberately avoided (common for vLLM and other local services).
@@ -495,8 +619,11 @@ All via `.env`. Full annotated template at [`.env.template`](.env.template).
 ## 🧪 Tests
 
 ```bash
-# Full suite (115 tests: 107 fast + 7 slow + 1 environment-conditional skip)
+# Full suite (131 tests: 123 fast + 7 slow + 1 environment-conditional skip)
 pytest
+
+# Just the GPU reranker sidecar unit tests (no torch / no GPU required)
+pytest reranker-rocm/tests/
 
 # Fast iteration (deselect slow LightRAG ingest tests)
 pytest -m 'not slow'
@@ -552,7 +679,8 @@ rag-base/
 ├── data/                   # Bind mounts (gitignored): postgres, memgraph, lightrag
 ├── postgres/               # Schema (init.sql) + container README
 ├── embedding/              # TEI embed container README
-├── reranker/               # TEI rerank container README
+├── reranker/               # TEI rerank (CPU) container README
+├── reranker-rocm/          # GPU rerank sidecar (Dockerfile + server.py + tests). One image, two roles (bge-gpu, qwen-4b) selected by RERANK_MODEL.
 ├── memgraph/               # Memgraph container README
 ├── api/                    # FastAPI app (only custom code)
 │   ├── Dockerfile
@@ -567,7 +695,6 @@ rag-base/
 ├── tests/                  # Unit + integration tests, golden set, integration_validation runner
 ├── scripts/                # Backup/restore
 ├── llm.txt                 # Full technical reference (LLM-ready)
-├── SHIP.md                 # Audit + ship report (2026-04-27)
 └── README.md               # This file
 ```
 

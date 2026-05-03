@@ -10,9 +10,14 @@ class Settings(BaseSettings):
     # TEI embedding
     embedding_url: str = "http://embedding:80"
 
-    # TEI reranker
+    # TEI reranker (default, CPU)
     reranker_url: str = "http://reranker:80"
     rerank_enabled: bool = True
+
+    # Optional GPU reranker sidecars (additive; default behavior unchanged when unset)
+    bge_gpu_reranker_url: str | None = None
+    qwen_reranker_url: str | None = None
+    qwen_8b_reranker_url: str | None = None
 
     # Memgraph
     memgraph_url: str = "bolt://memgraph:7687"

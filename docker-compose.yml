@@ -61,6 +61,103 @@ services:
     profiles:
       - rerank
 
+  # ── Reranker GPU sidecar (BGE-v2-m3) ─────────────────────
+  # OPTIONAL. Same model as the CPU TEI reranker, but on the AMD Strix Halo
+  # GPU via ROCm gfx1151 prerelease wheels. Picked at request time by the
+  # API when SearchRequest.rerank_model == "bge-gpu". Falls back silently to
+  # the default CPU reranker if this container is not running.
+  # Start with: docker compose --profile rerank-bge-gpu up -d
+  reranker-bge-gpu:
+    build:
+      context: ./reranker-rocm
+      dockerfile: Dockerfile
+    image: reranker-rocm:local
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      RERANK_MODEL: BAAI/bge-reranker-v2-m3
+      MODEL_CACHE: /data/models
+      RERANK_BATCH_SIZE: ${BGE_GPU_RERANK_BATCH_SIZE:-8}
+    ports:
+      - "127.0.0.1:${BGE_GPU_RERANK_PORT:-8083}:80"
+    volumes:
+      - ${RERANKER_MODELS_DIR:?Set RERANKER_MODELS_DIR in .env}:/data/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+    profiles:
+      - rerank-bge-gpu
+
+  # ── Reranker GPU sidecar (Qwen3-Reranker-4B) ─────────────
+  # OPTIONAL. Larger, instruction-tuned LM-style reranker. Picked at request
+  # time when SearchRequest.rerank_model == "qwen-4b". Falls back silently to
+  # the default CPU reranker if this container is not running.
+  # Start with: docker compose --profile rerank-qwen up -d
+  reranker-qwen:
+    build:
+      context: ./reranker-rocm
+      dockerfile: Dockerfile
+    image: reranker-rocm:local
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      RERANK_MODEL: Qwen/Qwen3-Reranker-4B
+      RERANK_REVISION: 22e683669bc0f0bd69640a1354a6d0aebcfeede5
+      MODEL_CACHE: /data/models
+      RERANK_BATCH_SIZE: ${QWEN_RERANK_BATCH_SIZE:-8}
+    ports:
+      - "127.0.0.1:${QWEN_RERANK_PORT:-8084}:80"
+    volumes:
+      - ${RERANKER_MODELS_DIR:?Set RERANKER_MODELS_DIR in .env}:/data/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    profiles:
+      - rerank-qwen
+
+  # ── Reranker GPU sidecar (Qwen3-Reranker-8B) ─────────────
+  # OPTIONAL. The 8B sibling of the 4B reranker. Picked at request time when
+  # SearchRequest.rerank_model == "qwen-8b". On a small corpus the 8B is a
+  # wash vs 4B; the value shows up on harder/longer adversarial corpora. Falls
+  # back silently to the default CPU reranker if this container is not running.
+  # ~16 GiB VRAM at fp16. Start with: docker compose --profile rerank-qwen-8b up -d
+  reranker-qwen-8b:
+    build:
+      context: ./reranker-rocm
+      dockerfile: Dockerfile
+    image: reranker-rocm:local
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      RERANK_MODEL: Qwen/Qwen3-Reranker-8B
+      RERANK_REVISION: 77d193c791ed
+      MODEL_CACHE: /data/models
+      RERANK_BATCH_SIZE: ${QWEN_8B_RERANK_BATCH_SIZE:-4}
+    ports:
+      - "127.0.0.1:${QWEN_8B_RERANK_PORT:-8085}:80"
+    volumes:
+      - ${RERANKER_MODELS_DIR:?Set RERANKER_MODELS_DIR in .env}:/data/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1200s
+    profiles:
+      - rerank-qwen-8b
+
   # ── Memgraph MAGE — Graph Engine ─────────────────────────
   # OPTIONAL. Only starts with: docker compose --profile graph up -d
   # API detects its absence and degrades gracefully.
@@ -98,6 +195,10 @@ services:
       EMBEDDING_URL: http://embedding:80
       RERANKER_URL: http://reranker:80
       RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      # Optional GPU reranker sidecars (additive; default unchanged when unset)
+      BGE_GPU_RERANKER_URL: ${BGE_GPU_RERANKER_URL:-}
+      QWEN_RERANKER_URL: ${QWEN_RERANKER_URL:-}
+      QWEN_8B_RERANKER_URL: ${QWEN_8B_RERANKER_URL:-}
       # Memgraph
       MEMGRAPH_URL: bolt://memgraph:7687
       MEMGRAPH_ENABLED: ${MEMGRAPH_ENABLED:-true}

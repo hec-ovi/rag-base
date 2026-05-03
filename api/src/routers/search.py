@@ -10,7 +10,7 @@ from src.services.embedding import embed_single
 from src.services.fusion import reciprocal_rank_fusion
 from src.services.keyword_search import search_keyword
 from src.services.lightrag_store import extract_query_entities, find_docs_via_graph
-from src.services.reranking import rerank
+from src.services.reranking import rerank, select_rerank_client
 from src.services.vector_store import search_semantic, search_semantic_in_docs
 
 router = APIRouter(tags=["search"])
@@ -61,7 +61,7 @@ async def hybrid_search(body: SearchRequest, request: Request):
     """Hybrid search: parallel fan-out → RRF merge → optional rerank."""
     pool = request.app.state.db_pool
     embed_client = request.app.state.embed_client
-    rerank_client = request.app.state.rerank_client
+    rerank_client, _fallback_used = select_rerank_client(request.app.state, body.rerank_model)
     graph_driver = getattr(request.app.state, "graph_driver", None)
     lightrag = getattr(request.app.state, "lightrag", None)
     llm_complete = getattr(request.app.state, "llm_complete", None)

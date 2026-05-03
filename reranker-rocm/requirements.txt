@@ -1,0 +1,9 @@
+# Pinned for reproducibility. torch is installed separately from the ROCm
+# gfx1151 prerelease index in the Dockerfile and is intentionally NOT listed
+# here so a stray `pip install -r requirements.txt` on a CUDA box does not
+# pull a wrong wheel.
+transformers>=4.51,<5
+sentence-transformers==5.4.1
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.5,<3

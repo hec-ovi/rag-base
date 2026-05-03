@@ -1,6 +1,11 @@
 """Search schemas."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+RerankModel = Literal["default", "bge-gpu", "qwen-4b", "qwen-8b"]
 
 
 class SearchRequest(BaseModel):
@@ -10,6 +15,7 @@ class SearchRequest(BaseModel):
     rerank_candidates: int = Field(default=50, ge=1, le=200)
     min_score: float = Field(default=0.0, ge=0.0, le=1.0)
     include_graph: bool = True
+    rerank_model: RerankModel | None = None  # None == today's behavior (default CPU TEI)
 
 
 class SearchResult(BaseModel):
